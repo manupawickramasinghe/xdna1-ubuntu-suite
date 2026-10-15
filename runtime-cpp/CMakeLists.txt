@@ -14,5 +14,11 @@ set_target_properties(xdna_daemon PROPERTIES
   BUILD_RPATH "${XRT_ROOT}/lib"
   INSTALL_RPATH "${XRT_ROOT}/lib")
 
-install(TARGETS xdna_daemon RUNTIME DESTINATION bin)
+add_executable(xdna_burn xdna_burn.cpp)
+target_include_directories(xdna_burn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(xdna_burn PRIVATE xrt_coreutil Threads::Threads)
+target_compile_options(xdna_burn PRIVATE -Wall -Wextra)
+set_target_properties(xdna_burn PROPERTIES BUILD_RPATH "${XRT_ROOT}/lib" INSTALL_RPATH "${XRT_ROOT}/lib")
+
+install(TARGETS xdna_daemon xdna_burn RUNTIME DESTINATION bin)
 install(FILES xdna_runner.hpp DESTINATION include/xdna)
