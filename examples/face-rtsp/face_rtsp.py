@@ -40,6 +40,11 @@ class Embedder:
             import onnxruntime as ort
             self.sess = ort.InferenceSession(str(SFACE), providers=["CPUExecutionProvider"])
             self.inp = self.sess.get_inputs()[0].name
+        elif backend == "npu":
+            # Convs/FC as bf16 matmuls on the XDNA NPU (see npu_cnn.py)
+            from npu_cnn import OnnxNpuModel
+
+            self.npu = OnnxNpuModel(str(SFACE))
         elif backend == "iree":
             import iree.runtime as rt
             cfg = rt.Config(device)
@@ -54,6 +59,8 @@ class Embedder:
         blob = cv2.dnn.blobFromImage(crop, 1.0, (112, 112), swapRB=True)  # 1x3x112x112 float32 RGB
         if self.backend == "cpu":
             v = self.sess.run(None, {self.inp: blob})[0]
+        elif self.backend == "npu":
+            v = self.npu(blob)
         else:
             v = np.asarray(self.fn(blob))
         v = v.reshape(-1).astype(np.float32)
@@ -157,7 +164,7 @@ def cmd_run(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default=os.environ.get("FACE_RTSP_URL", "rtsp://192.168.1.69:8554/stream"))
-    ap.add_argument("--embed", choices=["cpu", "iree"], default="cpu")
+    ap.add_argument("--embed", choices=["cpu", "npu", "iree"], default="cpu")
     ap.add_argument("--vmfb", default=str(HERE / "build" / "sface_npu.vmfb"))
     ap.add_argument("--device", default="amdxdna", help="IREE HAL device (amdxdna = NPU, local-task = CPU)")
     ap.add_argument("--score", type=float, default=0.7)

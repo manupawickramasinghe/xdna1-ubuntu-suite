@@ -75,3 +75,27 @@ Built `nod-ai/iree-amd-aie` @ `fddfec1b` (IREE 3.12.0.dev `2608330`) from source
 * Consequence: face (SFace/ArcFace) and plate OCR (PaddleOCR det/rec, LPRNet) can't run on
   npu1 through IREE today. Only matmul-dominated graphs are candidates, and per-dispatch overhead
   (~2 ms) rules out small models anyway.
+
+## Face recognition on the NPU via im2col + bf16 matmul (2026-10-15)
+
+`examples/face-rtsp/npu_cnn.py` interprets the ONNX graph on the host: regular Conv (im2col) and
+Gemm run as padded bf16 matmuls on the NPU through IREE; depthwise conv and elementwise ops stay
+on the CPU; BatchNorm is folded into the conv weights. SFace: 15 NPU matmuls per face, 11 shapes.
+
+**IREE-AMD-AIE npu1 matmul bugs found (repeat test, 20 runs per shape, random bf16 data):**
+* `M = 12544` (K 32/64): wrong results (~24% of elements) on every run. Workaround: split M into
+  chunks of ≤ 3136.
+* `K = 32` (M 3136): **intermittently** wrong: 7/20 and 13/20 runs. A single verification pass
+  can miss it. Workaround: pad K to ≥ 64.
+* All other tested shapes (K 64–50176, M 4–3136, N 128–1024): 0/20 wrong.
+* The engine now verifies each new shape 10× on random data before using it, and falls back to CPU
+  otherwise.
+
+**Python bindings pitfalls:** keep each `SystemContext` alive (a function handle alone → segfault),
+and copy results (`np.array(res.to_host(), copy=True)`): `np.asarray(res)` views mapped device
+memory that is unmapped when `res` is freed (segfault).
+
+**Result on the live RTSP stream, 194 identical face crops:** NPU vs CPU embedding cosine min
+0.9999; 194/194 matches on both; identical decisions on every face. Speed: **170 ms/face on the NPU
+path vs 20 ms on CPU** (onnxruntime). Each NPU call costs ~10 ms through IREE's Python runtime +
+amdxdna HAL, and that dominates.

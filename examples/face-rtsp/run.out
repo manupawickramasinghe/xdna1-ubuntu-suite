@@ -1,0 +1,7 @@
+calling
+Fatal Python error: Segmentation fault
+
+Current thread 0x000078326655a080 (most recent call first):
+  File "<string>", line 7 in <module>
+
+Extension modules: numpy._core._multiarray_umath, numpy.linalg._umath_linalg, google._upb._message, numpy.random._common, numpy.random.bit_generator, numpy.random._bounded_integers, numpy.random._pcg64, numpy.random._generator, numpy.random._mt19937, numpy.random._philox, numpy.random._sfc64, numpy.random.mtrand (total: 12)
