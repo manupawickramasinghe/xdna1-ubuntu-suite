@@ -45,3 +45,13 @@ no `drm-driver`, `drm-total-memory` or `drm-engine-*` keys.
 * Clocks come from `QUERY_CLOCK_METADATA`, not `QUERY_AIE_METADATA`.
 * Per-process memory comes from `GET_ARRAY / DRM_AMDXDNA_BO_USAGE`, not fdinfo.
 * The PCI device ID `1502` covers Phoenix and Hawk Point; `17f0` is Strix/Krackan (XDNA2).
+
+## Under real XRT load (2026-10-15)
+
+* `GET_ARRAY / HW_CONTEXT_ALL` works as expected: per-context `start_col/num_col`, and
+  submissions/completions advance, so busy detection and cmd/s are correct.
+* **User contexts are placed on columns 1–4 only; column 0 is never assigned.** A 5th
+  single-column context shares column 1. Column-occupancy utilisation therefore tops out at 80%.
+* Malformed `CREATE_HWCTX` (no XRT partition params) logs
+  `amdxdna_gem_heap_alloc: Invalid dev heap userptr` and fails with EINVAL; that's harmless.
+* Burn test results: [results/README.md](results/README.md).
