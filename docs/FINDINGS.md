@@ -55,3 +55,23 @@ no `drm-driver`, `drm-total-memory` or `drm-engine-*` keys.
 * Malformed `CREATE_HWCTX` (no XRT partition params) logs
   `amdxdna_gem_heap_alloc: Invalid dev heap userptr` and fails with EINVAL; that's harmless.
 * Burn test results: [results/README.md](results/README.md).
+
+## IREE + AMD-AIE on npu1 (2026-10-15)
+
+Built `nod-ai/iree-amd-aie` @ `fddfec1b` (IREE 3.12.0.dev `2608330`) from source with the
+`amd_aie` compiler plugin and `amdxdna` HAL driver. Peano: `llvm-aie 22.0.0.2026101201`.
+
+* `iree-run-module --list_devices=amdxdna` → `amdxdna://`; the HAL driver works with the
+  in-tree kernel 7.1 amdxdna driver.
+* **bf16 MatMul from ONNX runs on the NPU and is correct.** 128×256 · 256×128, flags:
+  `--iree-hal-target-backends=amd-aie --iree-amdaie-target-device=npu1_4col
+  --iree-amdaie-device-hal=amdxdna --iree-amdaie-stack-size=2048` (default 1024 B stack is
+  too small with this Peano). Max error 1 bf16 ULP vs numpy; **2.06 ms per call** end to end.
+* **CNNs do not compile.** SFace (MobileFaceNet-style, 27 Conv incl. depthwise + Gemm), with
+  contraction inputs demoted to bf16: 20 dispatches fail with `Unhandled pass pipeline in
+  setRootConfig` (conv ops arrive as `linalg.generic`); with `--iree-amdaie-tile-pipeline=
+  conv-decompose`, 21 fail. Upstream's own CI says the same: named conv ops lowered to
+  `linalg.generic` are unsupported, and depthwise conv tests are disabled.
+* Consequence: face (SFace/ArcFace) and plate OCR (PaddleOCR det/rec, LPRNet) can't run on
+  npu1 through IREE today. Only only matmul-dominated graphs are candidates, and per-dispatch overhead
+  (~2 ms) rules out small models anyway.

@@ -32,7 +32,7 @@ COSINE_MATCH = 0.363  # SFace's recommended cosine threshold
 class Embedder:
     """SFace on a 112x112 aligned face → L2-normalised 128-d vector."""
 
-    def __init__(self, backend: str, vmfb: str | None, device: str):
+    def __init__(self, backend: str, vmfb: str | None, device: str, fn: str = "mxnet_converted_model"):
         # cv2's recognizer only does alignment here; inference runs on the chosen backend.
         self.align = cv2.FaceRecognizerSF.create(str(SFACE), "")
         self.backend = backend
@@ -45,7 +45,7 @@ class Embedder:
             cfg = rt.Config(device)
             self.ctx = rt.SystemContext(config=cfg)
             self.ctx.add_vm_module(rt.VmModule.mmap(cfg.vm_instance, vmfb))
-            self.fn = self.ctx.modules.module["main_graph"]
+            self.fn = self.ctx.modules.module[fn]  # entry point named after the ONNX graph
         else:
             raise ValueError(backend)
 
