@@ -1,0 +1,5 @@
+# Biometric enrolment data must never be committed (public repo)
+enrolled/
+# Downloaded models (see get_models.sh)
+models/
+build/
