@@ -4,3 +4,4 @@ target/
 *.xclbin
 *.bin
 !docs/**
+npu-face-rs/target/
