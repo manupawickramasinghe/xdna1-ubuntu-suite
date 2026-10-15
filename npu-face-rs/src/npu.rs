@@ -322,14 +322,6 @@ impl NpuMatmul {
         Ok(c)
     }
 
-    /// Kernel tile shape used for a packed weight (diagnostics).
-    pub fn kernel_of(&self, b: &PackedB) -> Option<(usize, usize, usize)> {
-        match b {
-            PackedB::Npu { kernel, .. } => self.kernels.get(*kernel).map(|k| (k.tm, k.tk, k.tn)),
-            _ => None,
-        }
-    }
-
     fn best_kernel(&self, m: usize, k: usize, n: usize) -> usize {
         // host work per call (fill A, flush, accumulate) is ~0.15-0.2 ms; count it
         const HOST_PER_CALL: f64 = 0.18e-3;

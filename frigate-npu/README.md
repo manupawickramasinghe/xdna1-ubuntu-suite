@@ -9,13 +9,20 @@ Frigate container (host network)                     host
                                                      bf16 matmuls on /dev/accel/accel0 (XRT)
 ```
 
+## NPU usage on the System page
+
+`npu-face` also serves `GET http://127.0.0.1:5801/stats` (inference port + 1): NPU busy % since the
+last poll, embeddings/s, mean latency, H-clock, NPU buffer memory. Frigate's `set_npu_usages()`
+(patched by `patch_stats.py`) reports it as `npu_usages["amd-xdna"]`, which the existing **System →
+General → NPU usage** chart renders. No web UI change is needed.
+
 ## Deploy (as done on the 8600G, 2026-10-15)
 
 1. `npu-face-rs`: `CC=gcc-14 CXX=g++-14 cargo build --release`
 2. Copy `arcface.onnx` into `/mnt/docker/frigate/config/model_cache/facedet/`, or let Frigate download it.
 3. `sudo install -m644 npu-face.service /etc/systemd/system/ && sudo systemctl enable --now npu-face`.
    The service validates every NPU layer at startup and won't serve if any layer is wrong.
-4. `docker build -t frigate-ncnn-vulkan-npu:latest .` (FROM the current image; only adds the runner).
+4. `docker build -t frigate-ncnn-vulkan-npu:latest .` (FROM the current image; adds the runner and the stats hook).
 5. In `docker-compose.yml`, set `image: frigate-ncnn-vulkan-npu:latest`. In `config.yml`:
    ```yaml
    face_recognition:

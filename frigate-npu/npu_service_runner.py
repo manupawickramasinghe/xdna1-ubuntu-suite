@@ -8,6 +8,7 @@ embeddings over a small length-prefixed TCP protocol.
 Select it with `device: npu` (default 127.0.0.1:5800) or `device: npu://host:port`.
 """
 
+import json
 import logging
 import socket
 import struct
@@ -40,6 +41,39 @@ def parse_npu_device(device: str | None) -> tuple[str, int] | None:
             )
         return host, int(port)
     return None
+
+
+def get_npu_service_stats(
+    endpoint: tuple[str, int], timeout: float = 0.5
+) -> dict[str, Any] | None:
+    """Fetch NPU usage from the service's stats port (inference port + 1).
+
+    Returns the shape the System page expects for `npu_usages` entries:
+    {"npu": busy_percent, "mem": "<NPU buffer MiB> MiB", ...extra fields}.
+    """
+    host, port = endpoint
+    try:
+        with socket.create_connection((host, port + 1), timeout=timeout) as sock:
+            sock.sendall(b"GET /stats HTTP/1.0\r\n\r\n")
+            data = b""
+            while chunk := sock.recv(4096):
+                data += chunk
+    except OSError:
+        return None
+
+    _, _, body = data.partition(b"\r\n\r\n")
+    try:
+        raw = json.loads(body)
+    except ValueError:
+        return None
+
+    return {
+        "npu": round(float(raw.get("npu", 0.0)), 1),
+        "mem": f"{raw.get('bo_mem_mib', 0):.0f} MiB",
+        "embeddings_per_s": raw.get("embeddings_per_s"),
+        "mean_latency_ms": raw.get("mean_latency_ms"),
+        "clock_mhz": raw.get("h_clock_mhz"),
+    }
 
 
 class NpuServiceRunner(BaseModelRunner):

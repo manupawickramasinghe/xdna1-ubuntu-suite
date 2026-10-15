@@ -2,7 +2,12 @@
 //!
 //!   npu-face selftest --model arcface.onnx      NPU vs exact-f32 CPU on random inputs
 //!   npu-face bench    --model arcface.onnx      latency per embedding
-//!   npu-face serve    --model arcface.onnx [--listen 127.0.0.1:5800]
+//!   npu-face serve    --model arcface.onnx [--listen 127.0.0.1:5800] [--stats 127.0.0.1:5801]
+//!
+//! `serve` also answers `GET /stats` (JSON) on the --stats address: NPU busy %
+//! since the previous request, embeddings/s, mean latency, plus driver
+//! telemetry (H-clock, NPU buffer memory, column occupancy). Frigate's System
+//! page polls it.
 //!
 //! Wire protocol (little-endian), one request at a time per connection:
 //!   request : u32 magic "XFQ1" | u32 n | u32 c | u32 h | u32 w | f32[n*c*h*w]
@@ -11,12 +16,15 @@
 
 mod model;
 mod npu;
+#[allow(dead_code)]
+mod telemetry;
 
 use anyhow::{bail, Context, Result};
 use model::{Model, Tensor};
 use npu::{CpuMatmul, Matmul, NpuMatmul};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const REQ_MAGIC: u32 = u32::from_le_bytes(*b"XFQ1");
@@ -27,6 +35,7 @@ struct Opts {
     model: String,
     kernels: String,
     listen: String,
+    stats: String,
     iters: usize,
 }
 
@@ -45,6 +54,7 @@ fn parse() -> Result<Opts> {
         model: String::new(),
         kernels: kdir,
         listen: "127.0.0.1:5800".into(),
+        stats: "127.0.0.1:5801".into(),
         iters: 20,
     };
     let mut args = std::env::args().skip(1);
@@ -55,6 +65,7 @@ fn parse() -> Result<Opts> {
             "--model" => o.model = v()?,
             "--kernels" => o.kernels = v()?,
             "--listen" => o.listen = v()?,
+            "--stats" => o.stats = v()?,
             "--iters" => o.iters = v()?.parse()?,
             _ => bail!("unknown option {a}"),
         }
@@ -205,6 +216,68 @@ fn respond(w: &mut impl Write, status: i32, n: u32, dim: u32, payload: &[u8]) ->
     w.write_all(payload)
 }
 
+#[derive(Default)]
+struct ServiceStats {
+    /// cumulative seconds the NPU pipeline was running tiles
+    busy: f64,
+    embeddings: u64,
+    latency_sum: f64,
+    started: Option<Instant>,
+}
+
+/// Minimal HTTP/1.0 `GET /stats` responder on its own thread, so stats never
+/// wait behind a face request (and vice versa).
+fn spawn_stats_server(addr: String, st: Arc<Mutex<ServiceStats>>, model: String) -> Result<()> {
+    let listener = TcpListener::bind(&addr).with_context(|| format!("binding stats {addr}"))?;
+    std::thread::spawn(move || {
+        let mut dev = telemetry::discover().into_iter().next().and_then(|i| telemetry::Device::open(i).ok());
+        let mut last: Option<(Instant, f64, u64)> = None;
+        for conn in listener.incoming() {
+            let Ok(mut c) = conn else { continue };
+            let mut buf = [0u8; 1024];
+            let n = c.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if !req.starts_with("GET /stats") {
+                let _ = c.write_all(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                continue;
+            }
+            let now = Instant::now();
+            let (busy, emb, lat_sum, uptime) = {
+                let s = st.lock().unwrap();
+                (s.busy, s.embeddings, s.latency_sum, s.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0))
+            };
+            let (busy_pct, eps) = match last {
+                Some((t, b, e)) => {
+                    let dt = now.duration_since(t).as_secs_f64().max(1e-3);
+                    (((busy - b) / dt * 100.0).clamp(0.0, 100.0), (emb - e) as f64 / dt)
+                }
+                None => ((busy / uptime.max(1e-3) * 100.0).clamp(0.0, 100.0), emb as f64 / uptime.max(1e-3)),
+            };
+            last = Some((now, busy, emb));
+            let t = dev.as_mut().map(|d| d.sample(false));
+            let (clk, mem, cols, pm) = t
+                .map(|t| (t.h_mhz, t.mem_used, t.util_pct, t.runtime_status))
+                .unwrap_or((0, 0, 0.0, "unknown".into()));
+            let body = format!(
+                "{{\"npu\":{:.1},\"embeddings_per_s\":{:.3},\"embeddings\":{},\"mean_latency_ms\":{:.1},\"h_clock_mhz\":{},\"bo_mem_mib\":{:.1},\"column_occupancy\":{:.0},\"runtime_pm\":\"{}\",\"model\":\"{}\"}}",
+                busy_pct,
+                eps,
+                emb,
+                if emb > 0 { lat_sum / emb as f64 * 1e3 } else { 0.0 },
+                clk,
+                mem as f64 / 1048576.0,
+                cols,
+                pm,
+                model.replace('"', "'")
+            );
+            let _ = c.write_all(
+                format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes(),
+            );
+        }
+    });
+    Ok(())
+}
+
 fn serve(o: &Opts) -> Result<()> {
     let mut npu = open_npu(o)?;
     let mut m = Model::load(&o.model)?;
@@ -219,8 +292,10 @@ fn serve(o: &Opts) -> Result<()> {
         bail!("startup check failed: NPU vs CPU cosine {c:.5}");
     }
     validate_layers(&mut m, &mut npu)?;
+    let st = Arc::new(Mutex::new(ServiceStats { started: Some(Instant::now()), ..Default::default() }));
+    spawn_stats_server(o.stats.clone(), st.clone(), o.model.clone())?;
     let listener = TcpListener::bind(&o.listen).with_context(|| format!("binding {}", o.listen))?;
-    eprintln!("npu-face: serving {} on {} (startup check cosine {c:.5}, {} NPU ops/embedding)", o.model, o.listen, m.npu_ops);
+    eprintln!("npu-face: serving {} on {} (stats on {}; startup check cosine {c:.5}, {} NPU ops/embedding)", o.model, o.listen, o.stats, m.npu_ops);
 
     for stream in listener.incoming() {
         let Ok(mut s) = stream else { continue };
@@ -251,7 +326,15 @@ fn serve(o: &Opts) -> Result<()> {
             for i in 0..n {
                 let per = c * h * w;
                 let x = Tensor::new(vec![1, c, h, w], data[i * per..(i + 1) * per].to_vec());
-                match m.run(&mut npu, x) {
+                let (t0, busy0) = (Instant::now(), npu.stats().1);
+                let r = m.run(&mut npu, x);
+                {
+                    let mut s = st.lock().unwrap();
+                    s.busy += npu.stats().1 - busy0;
+                    s.embeddings += 1;
+                    s.latency_sum += t0.elapsed().as_secs_f64();
+                }
+                match r {
                     Ok(y) => {
                         dim = y.data.len();
                         out.extend(y.data.iter().flat_map(|v| v.to_le_bytes()));
