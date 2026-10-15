@@ -7,8 +7,8 @@ PCI `1022:1502`, `RyzenAI-npu1`) on Ubuntu / Pop!_OS 24.04:
 | --- | --- | --- |
 | `include/xdna_telemetry.hpp` + `tools/xdna_stat` | ✅ working, tested on 8600G | Header-only C++20 telemetry reader for the in-tree `amdxdna` driver |
 | `btop-patch/` | ✅ working, tested on 8600G | Adds the NPU as a panel in [btop](https://github.com/aristocratos/btop): `btop-patch/build_btop.sh` |
-| `scripts/install_xdna1_ubuntu.sh` | 🚧 | XRT + `xrt_plugin-amdxdna` build/installer and hardware validator |
-| `runtime-cpp/` | 🚧 | XRT-based `.xclbin` runner + Unix-socket daemon with `--benchmark-loop` |
+| `scripts/install_xdna1_ubuntu.sh` | 🧪 preflight tested; build/install need sudo | Staged XRT + `xrt_plugin-amdxdna` builder/installer with a Pop!_OS flavor shim |
+| `runtime-cpp/` | 🧪 compiles against XRT headers; not yet run on hardware | XRT `.xclbin` runner + Unix-socket daemon with `--benchmark-loop` |
 | `monitor-rs/` | 🚧 | Standalone Rust TUI (`xdna-top`) |
 
 ## What the kernel actually exposes (verified on kernel 7.1, Ryzen 5 8600G)

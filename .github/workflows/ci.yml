@@ -1,0 +1,28 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      XRT_COMMIT: 1ea5176dbcdd31bb1cbe035661f1127e2be22574
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build xdna_stat (vendored UAPI header)
+        run: |
+          cmake -S . -B build -DCMAKE_CXX_FLAGS=-DXDNA_USE_VENDORED_UAPI
+          cmake --build build -j
+      - name: Fetch XRT public headers
+        run: |
+          git clone -q --filter=blob:none --no-checkout https://github.com/Xilinx/XRT.git xrt
+          git -C xrt sparse-checkout set --no-cone 'src/runtime_src/core/include/*' 'src/CMake/config/version-slim.h.in'
+          git -C xrt checkout -q "$XRT_COMMIT"
+          mkdir -p stub/xrt/detail
+          sed 's/@[A-Za-z_]*@/0/g' xrt/src/CMake/config/version-slim.h.in > stub/xrt/detail/version-slim.h
+      - name: Compile-check runtime-cpp against XRT headers
+        run: g++ -std=c++20 -fsyntax-only -Wall -Wextra -Iruntime-cpp -Istub -Ixrt/src/runtime_src/core/include runtime-cpp/xdna_daemon.cpp
+      - name: Check scripts
+        run: |
+          bash -n scripts/install_xdna1_ubuntu.sh btop-patch/build_btop.sh
+          shellcheck -S error scripts/install_xdna1_ubuntu.sh btop-patch/build_btop.sh
