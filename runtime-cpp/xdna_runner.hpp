@@ -7,7 +7,11 @@
 //   arg 0  opcode (3 = run DPU instruction stream)
 //   arg 1  instruction BO           group_id(1), cacheable
 //   arg 2  instruction word count
-//   arg 3+ data BOs: inputs..., output   group_id(3 + i), host_only
+//   arg 3+ data BOs in the design's runtime-sequence order   group_id(3 + i), host_only
+//
+// The output's position among the data BOs depends on the design: newer IRON
+// designs built with `transform` take (in, out, *params), e.g. mlir-aie
+// vector_scalar_mul is (A, C, factor) → out_pos = 1. Default: after all inputs.
 //
 // Buffers are allocated by XRT (page-aligned, pinned through the amdxdna
 // driver), so callers never need aligned_alloc themselves.
@@ -40,6 +44,7 @@ struct RunnerConfig {
 	size_t output_bytes = 0;
 	unsigned device_index = 0;
 	unsigned opcode = 3;
+	int out_pos = -1;                  // index of the output among data BOs; -1 = last
 };
 
 //* Load an mlir-aie instruction stream. Binary files are raw little-endian
@@ -88,19 +93,23 @@ public:
 		bo_instr_.write(instr.data());
 		bo_instr_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-		int arg = 3;
-		for (size_t bytes : cfg_.input_bytes) {
-			bo_in_.emplace_back(device_, bytes, xrt::bo::flags::host_only, kernel_.group_id(arg++));
-			std::memset(bo_in_.back().map<uint8_t*>(), 0, bytes);
-		}
-		out_arg_ = arg;
+		const size_t n_data = cfg_.input_bytes.size() + 1;
+		if (cfg_.out_pos < 0) cfg_.out_pos = static_cast<int>(n_data - 1);
+		if (static_cast<size_t>(cfg_.out_pos) >= n_data) throw std::invalid_argument("out_pos out of range");
+		out_arg_ = 3 + cfg_.out_pos;
 		bo_out_ = xrt::bo(device_, cfg_.output_bytes, xrt::bo::flags::host_only, kernel_.group_id(out_arg_));
+		for (size_t i = 0, slot = 0; i < cfg_.input_bytes.size(); ++i, ++slot) {
+			if (static_cast<int>(slot) == cfg_.out_pos) ++slot;
+			in_args_.push_back(static_cast<int>(3 + slot));
+			bo_in_.emplace_back(device_, cfg_.input_bytes[i], xrt::bo::flags::host_only, kernel_.group_id(in_args_.back()));
+			std::memset(bo_in_.back().map<uint8_t*>(), 0, cfg_.input_bytes[i]);
+		}
 
 		run_ = xrt::run(kernel_);
 		run_.set_arg(0, cfg_.opcode);
 		run_.set_arg(1, bo_instr_);
 		run_.set_arg(2, static_cast<uint32_t>(instr_words_));
-		for (size_t i = 0; i < bo_in_.size(); ++i) run_.set_arg(static_cast<int>(3 + i), bo_in_[i]);
+		for (size_t i = 0; i < bo_in_.size(); ++i) run_.set_arg(in_args_[i], bo_in_[i]);
 		run_.set_arg(out_arg_, bo_out_);
 	}
 
@@ -116,6 +125,9 @@ public:
 	//* Sync inputs, execute, sync output. Throws on error or timeout.
 	std::span<const uint8_t> run(std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
 		for (auto& b : bo_in_) b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+		// Flush any CPU writes to the output BO too: otherwise dirty cache lines
+		// can be written back over the NPU's results after it finishes.
+		bo_out_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 		run_.start();
 		if (run_.wait2(timeout) == std::cv_status::timeout) {
 			run_.abort();
@@ -153,6 +165,7 @@ private:
 	xrt::run run_;
 	size_t instr_words_ = 0;
 	int out_arg_ = 3;
+	std::vector<int> in_args_;
 };
 
 } // namespace xdna

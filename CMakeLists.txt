@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-option(XDNA_BUILD_RUNTIME "Build the XRT-based inference runner/daemon (needs /opt/xilinx/xrt)" AUTO)
+set(XDNA_BUILD_RUNTIME AUTO CACHE STRING "Build the XRT runner/daemon/burn tools: AUTO, ON or OFF (needs /opt/xilinx/xrt)")
 
 # Header-only telemetry library
 add_library(xdna_telemetry INTERFACE)

@@ -40,6 +40,7 @@ struct Opts {
 	int bench_runs = 2000;
 	double minutes = 10;
 	int timeout_ms = 1000;
+	int out_pos = 1;   // vector_scalar_mul runtime sequence is (A, C, factor)
 };
 
 struct Stats {
@@ -69,6 +70,7 @@ xdna::RunnerConfig runner_cfg(const Opts& o) {
 	rc.kernel_name = o.kernel;
 	rc.input_bytes = {o.elements * sizeof(int16_t), sizeof(int32_t)};
 	rc.output_bytes = o.elements * sizeof(int16_t);
+	rc.out_pos = o.out_pos;
 	return rc;
 }
 
@@ -152,6 +154,7 @@ int main(int argc, char** argv) {
 		else if (a == "--minutes") o.minutes = std::stod(next());
 		else if (a == "--timeout-ms") o.timeout_ms = std::stoi(next());
 		else if (a == "--json") o.json = next();
+		else if (a == "--out-pos") o.out_pos = std::stoi(next());
 		else usage(argv[0]);
 	}
 	if (o.xclbin.empty() || o.insts.empty() || o.contexts < 1) usage(argv[0]);

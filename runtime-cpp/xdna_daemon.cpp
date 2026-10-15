@@ -61,7 +61,7 @@ struct Options {
 [[noreturn]] void usage(const char* argv0, int code) {
 	std::fprintf(code ? stderr : stdout,
 	             "usage: %s --xclbin FILE --insts FILE --in BYTES[,BYTES...] --out BYTES\n"
-	             "          [--kernel NAME] [--device N] [--timeout-ms N]\n"
+	             "          [--kernel NAME] [--out-pos N] [--device N] [--timeout-ms N]\n"
 	             "          [--socket PATH | --benchmark-loop [--duty 1-100] [--period-ms N] [--seconds N]]\n",
 	             argv0);
 	std::exit(code);
@@ -94,6 +94,7 @@ Options parse(int argc, char** argv) {
 		else if (a == "--kernel") o.rc.kernel_name = next();
 		else if (a == "--in") o.rc.input_bytes = parse_sizes(next());
 		else if (a == "--out") o.rc.output_bytes = std::stoull(next());
+		else if (a == "--out-pos") o.rc.out_pos = std::stoi(next());
 		else if (a == "--device") o.rc.device_index = static_cast<unsigned>(std::stoul(next()));
 		else if (a == "--socket") o.socket_path = next();
 		else if (a == "--benchmark-loop") o.benchmark = true;

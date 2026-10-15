@@ -1,8 +1,14 @@
 # runtime-cpp: XRT runner and inference daemon
 
-**Status:** compiles against XRT `1ea5176` headers (`-fsyntax-only`, see CI). It hasn't run on
-hardware yet because XRT isn't installed on the dev box; run
-`scripts/install_xdna1_ubuntu.sh` first.
+**Status:** ✅ verified on a Ryzen 5 8600G with XRT 2.27.0 (built by `scripts/install_xdna1_ubuntu.sh`),
+running mlir-aie v1.3.4's `vector_scalar_mul`. See `docs/results/` for the burn test.
+
+Two lessons from bring-up:
+* **The output BO's argument slot depends on the design.** IRON designs built with
+  `transform` declare `(in, out, *params)`, so vector_scalar_mul is `(A, C, factor)` → `--out-pos 1`.
+  The wrong slot makes the NPU write results into an input buffer.
+* **Flush CPU writes to the output BO before a run.** `XdnaRunner::run()` syncs it `TO_DEVICE`;
+  otherwise dirty cache lines get written back over the NPU's results.
 
 * `xdna_runner.hpp`: `xdna::XdnaRunner` holds `xrt::device` → `xrt::hw_context` → `xrt::kernel`,
   the instruction BO, and pre-allocated input/output BOs. Each call does only BO sync + dispatch.
@@ -26,20 +32,30 @@ and produces an 8192-byte output.
 ## Build
 
 ```bash
-cmake -S . -B build && cmake --build build -j   # runtime builds automatically once /opt/xilinx/xrt exists
+cmake -S . -B build && cmake --build build -j   # → build/runtime-cpp/{xdna_daemon,xdna_burn} once /opt/xilinx/xrt exists
 ```
+
+## Benchmark + burn test
+
+```bash
+build/runtime-cpp/xdna_burn --xclbin final_8192.xclbin --insts insts_8192.bin \
+    --contexts 5 --minutes 10 --json report.json
+```
+
+Every run gets fresh random inputs and a poisoned output, and every element is verified. Exits
+non-zero on any mismatch, timeout, exception or amdxdna kernel-log error.
 
 ## Load generator (watch btop / xdna_stat)
 
 ```bash
-build/xdna_daemon --xclbin final_8192.xclbin --insts insts_8192.bin --in 8192,4 --out 8192 \
+build/xdna_daemon --xclbin final_8192.xclbin --insts insts_8192.bin --in 8192,4 --out 8192 --out-pos 1 \
     --benchmark-loop --duty 50 --period-ms 200
 ```
 
 ## Daemon
 
 ```bash
-build/xdna_daemon --xclbin final_8192.xclbin --insts insts_8192.bin --in 8192,4 --out 8192
+build/xdna_daemon --xclbin final_8192.xclbin --insts insts_8192.bin --in 8192,4 --out 8192 --out-pos 1
 python3 runtime-cpp/xdna_client.py --in 8192,4 -n 1000
 ```
 
