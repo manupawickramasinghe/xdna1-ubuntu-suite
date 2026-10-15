@@ -169,6 +169,8 @@ struct Sample {
 	uint64_t mem_used_bytes = 0;  // sum of per-process total BO usage
 
 	std::vector<Sensor> sensors;
+
+	bool fresh = false;           // true if this sample issued ioctls; false = cached/idle
 };
 
 inline std::string device_name(uint16_t vendor, uint16_t device) {
@@ -249,6 +251,7 @@ public:
 			last_query_ = o.last_query_;
 			last_mp_clk_ = o.last_mp_clk_;
 			last_h_clk_ = o.last_h_clk_;
+			last_processes_ = std::move(o.last_processes_);
 			idle_samples_before_backoff = o.idle_samples_before_backoff;
 			idle_backoff = o.idle_backoff;
 			last_error_ = std::move(o.last_error_);
@@ -312,6 +315,7 @@ public:
 		s.suspended = (s.runtime_status == "suspended");
 		if (fd_ < 0) return s;
 		if (s.suspended && !wake) {
+			carry_over_processes(s);
 			s.util_source = UtilSource::suspended;
 			prev_completions_.clear();
 			idle_streak_ = 0;
@@ -329,9 +333,11 @@ public:
 			s.mp_npu_clock_mhz = last_mp_clk_;
 			s.h_clock_mhz = last_h_clk_;
 			s.util_source = sensors_supported_ ? UtilSource::sensors : UtilSource::column_occupancy;
+			carry_over_processes(s);
 			return s;
 		}
 		last_query_ = s.when;
+		s.fresh = true;
 
 		amdxdna_drm_query_clock_metadata ck{};
 		if (get_info(DRM_AMDXDNA_QUERY_CLOCK_METADATA, &ck, sizeof ck)) {
@@ -372,6 +378,7 @@ public:
 		for (const auto& c : s.contexts) pids.insert(c.pid);
 		read_bo_usage(s, pids);
 
+		last_processes_ = s.processes;
 		last_mp_clk_ = s.mp_npu_clock_mhz;
 		last_h_clk_ = s.h_clock_mhz;
 		idle_streak_ = s.util_pct > 0 ? 0 : idle_streak_ + 1;
@@ -408,6 +415,17 @@ public:
 	}
 
 private:
+	//* BOs survive runtime suspend, so keep reporting the last-known usage of
+	//* processes that are still alive when we skip the ioctls.
+	void carry_over_processes(Sample& s) {
+		std::error_code ec;
+		std::erase_if(last_processes_, [&](const ProcUsage& p) {
+			return !fs::exists(fs::path("/proc") / std::to_string(p.pid), ec);
+		});
+		s.processes = last_processes_;
+		for (auto& p : s.processes) { p.contexts = 0; s.mem_used_bytes += p.total_bytes; }
+	}
+
 	void read_sensors(Sample& s) {
 		if (!sensors_supported_) return;
 		std::array<amdxdna_drm_query_sensor, 32> buf{};
@@ -494,6 +512,7 @@ private:
 	bool was_suspended_ = false;
 	std::chrono::steady_clock::time_point last_query_{};
 	uint32_t last_mp_clk_ = 0, last_h_clk_ = 0;
+	std::vector<ProcUsage> last_processes_;
 };
 
 } // namespace xdna

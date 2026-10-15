@@ -6,7 +6,7 @@ PCI `1022:1502`, `RyzenAI-npu1`) on Ubuntu / Pop!_OS 24.04:
 | Component | Status | What it is |
 | --- | --- | --- |
 | `include/xdna_telemetry.hpp` + `tools/xdna_stat` | ✅ working, tested on 8600G | Header-only C++20 telemetry reader for the in-tree `amdxdna` driver |
-| `btop-patch/` | 🚧 | Adds the NPU as a panel in [btop](https://github.com/aristocratos/btop) |
+| `btop-patch/` | ✅ working, tested on 8600G | Adds the NPU as a panel in [btop](https://github.com/aristocratos/btop): `btop-patch/build_btop.sh` |
 | `scripts/install_xdna1_ubuntu.sh` | 🚧 | XRT + `xrt_plugin-amdxdna` build/installer and hardware validator |
 | `runtime-cpp/` | 🚧 | XRT-based `.xclbin` runner + Unix-socket daemon with `--benchmark-loop` |
 | `monitor-rs/` | 🚧 | Standalone Rust TUI (`xdna-top`) |

@@ -1,0 +1,1480 @@
+From 20ed08f2229aa4d6151c0f297e8290e1ce51d554 Mon Sep 17 00:00:00 2001
+From: Manupa Wickramasinghe <manupawick18@gmail.com>
+Date: Thu, 15 Oct 2026 14:52:37 +0530
+Subject: [PATCH] gpu: add AMD XDNA NPU (amdxdna /dev/accel) collector
+
+Adds Gpu::Xdna, which reads the Ryzen AI NPU through the in-tree amdxdna
+driver's GET_INFO/GET_ARRAY ioctls and renders it as a GPU panel:
+utilisation (column sensors or column occupancy), H-clock, per-process
+BO memory, and power when amd-pmf exposes it. Enabled by shown_gpus
+containing "amd" or "npu". Never wakes a runtime-suspended NPU.
+---
+ src/btop.cpp                      |   3 +
+ src/btop_config.cpp               |   2 +-
+ src/btop_shared.hpp               |   3 +
+ src/linux/btop_collect.cpp        | 103 +++++
+ src/linux/xdna/amdxdna_accel.h    | 743 ++++++++++++++++++++++++++++++
+ src/linux/xdna/xdna_telemetry.hpp | 518 +++++++++++++++++++++
+ 6 files changed, 1371 insertions(+), 1 deletion(-)
+ create mode 100644 src/linux/xdna/amdxdna_accel.h
+ create mode 100644 src/linux/xdna/xdna_telemetry.hpp
+
+diff --git a/src/btop.cpp b/src/btop.cpp
+index 6b4400b..f744a2d 100644
+--- a/src/btop.cpp
++++ b/src/btop.cpp
+@@ -229,6 +229,9 @@ void clean_quit(int sig) {
+ 	Gpu::Nvml::shutdown();
+ 	Gpu::Rsmi::shutdown();
+ 	Gpu::Asysfs::shutdown();
++	#ifdef __linux__
++	Gpu::Xdna::shutdown();
++	#endif
+ 	#ifdef __APPLE__
+ 	Gpu::AppleSilicon::shutdown();
+ 	#endif
+diff --git a/src/btop_config.cpp b/src/btop_config.cpp
+index 3f0b0b0..8bd9407 100644
+--- a/src/btop_config.cpp
++++ b/src/btop_config.cpp
+@@ -260,7 +260,7 @@ namespace Config {
+ 		{"rsmi_measure_pcie_speeds",
+ 								"#* Measure PCIe throughput on AMD cards, may impact performance on certain cards."},
+ 		{"gpu_mirror_graph",	"#* Horizontally mirror the GPU graph."},
+-		{"shown_gpus",			"#* Set which GPU vendors to show. Available values are \"nvidia amd intel apple\""},
++		{"shown_gpus",			"#* Set which GPU vendors to show. Available values are \"nvidia amd intel apple npu\" (\"amd\" also enables AMD XDNA NPUs)"},
+ 		{"custom_gpu_name0",	"#* Custom gpu0 model name, empty string to disable."},
+ 		{"custom_gpu_name1",	"#* Custom gpu1 model name, empty string to disable."},
+ 		{"custom_gpu_name2",	"#* Custom gpu2 model name, empty string to disable."},
+diff --git a/src/btop_shared.hpp b/src/btop_shared.hpp
+index 0abd18c..1ac6882 100644
+--- a/src/btop_shared.hpp
++++ b/src/btop_shared.hpp
+@@ -190,6 +190,9 @@ namespace Gpu {
+ 	namespace Asysfs {
+ 		extern bool shutdown();
+ 	}
++	namespace Xdna {
++		extern bool shutdown();
++	}
+ 	#ifdef __APPLE__
+ 	namespace AppleSilicon {
+ 		extern bool shutdown();
+diff --git a/src/linux/btop_collect.cpp b/src/linux/btop_collect.cpp
+index fe4c8ba..7f4ec39 100644
+--- a/src/linux/btop_collect.cpp
++++ b/src/linux/btop_collect.cpp
+@@ -55,6 +55,9 @@ tab-size = 4
+ #include "../btop_log.hpp"
+ #include "../btop_shared.hpp"
+ #include "../btop_tools.hpp"
++#if defined(GPU_SUPPORT)
++#include "xdna/xdna_telemetry.hpp"
++#endif
+ 
+ #if defined(GPU_SUPPORT)
+ 	// Redefining C++ keywords fortunately has a warning in clang, however it's unavoidable here
+@@ -317,6 +320,17 @@ namespace Gpu {
+ 		uint32_t device_count = 0;
+ 		vector<device_paths> devices;
+ 	}
++
++	//? AMD XDNA NPU (Ryzen AI, /dev/accel/accelN) via the in-tree amdxdna driver.
++	//? Not a DRM card, so neither rocm-smi nor Asysfs enumerate it.
++	namespace Xdna {
++		bool initialized = false;
++		bool init();
++		bool shutdown();
++		template <bool is_init> bool collect(gpu_info* gpus_slice);
++		uint32_t device_count = 0;
++		vector<xdna::Device> devices;
++	}
+ }
+ 
+ #endif // GPU_SUPPORT
+@@ -405,6 +419,10 @@ namespace Shared {
+ 			Gpu::Intel::init();
+ 		}
+ 
++		if (shown_gpus.contains("amd") or shown_gpus.contains("npu")) {
++			Gpu::Xdna::init();
++		}
++
+ 		if (not Gpu::gpu_names.empty()) {
+ 			for (auto const& [key, _] : Gpu::gpus[0].gpu_percent)
+ 				Cpu::available_fields.push_back(key);
+@@ -2211,6 +2229,90 @@ namespace Gpu {
+ 		template bool collect<1>(gpu_info*);
+ 	}
+ 
++	namespace Xdna {
++		bool init() {
++			if (initialized) return false;
++
++			for (auto& info : xdna::discover()) {
++				xdna::Device dev(std::move(info));
++				if (not dev.open()) {
++					Logger::info("XDNA NPU: {} (is the user in the 'render' group?)", dev.last_error());
++					continue;
++				}
++				devices.push_back(std::move(dev));
++			}
++			if (devices.empty()) {
++				Logger::debug("No AMD XDNA NPU found under /sys/class/accel");
++				return false;
++			}
++
++			device_count = (uint32_t)devices.size();
++			const size_t offset = Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Intel::device_count;
++			gpus.resize(offset + device_count);
++			gpu_names.resize(offset + device_count);
++			for (uint32_t i = 0; i < device_count; ++i)
++				gpu_names[offset + i] = devices[i].info().name;
++
++			initialized = true;
++			Xdna::collect<1>(gpus.data() + offset);
++			return true;
++		}
++
++		bool shutdown() {
++			if (not initialized) return false;
++			devices.clear();
++			device_count = 0;
++			initialized = false;
++			return true;
++		}
++
++		template <bool is_init> bool collect(gpu_info* gpus_slice) {
++			if (not initialized) return false;
++
++			for (uint32_t i = 0; i < device_count; ++i) {
++				gpu_info& gpu = gpus_slice[i];
++				xdna::Device& dev = devices[i];
++
++				//? Never wakes a runtime-suspended NPU; backs off while idle (see xdna_telemetry.hpp).
++				const auto s = dev.sample(is_init);
++
++				if constexpr (is_init) {
++					gpu.supported_functions = {
++						.gpu_utilization = true,
++						.mem_utilization = false,
++						.gpu_clock = true,
++						.mem_clock = false,
++						.pwr_usage = s.power_mw.has_value(), //? needs amd-pmf NPU metrics; ENODEV on desktop APUs
++						.pwr_state = false,
++						.temp_info = false,
++						.mem_total = false, //? BOs live in host memory; there is no fixed pool to report
++						.mem_used = true,
++						.pcie_txrx = false,
++						.encoder_utilization = false,
++						.decoder_utilization = false,
++					};
++					gpu.pwr_max_usage = 0;
++				}
++
++				gpu.gpu_percent.at("gpu-totals").push_back(std::clamp((long long)std::round(s.util_pct), 0LL, 100LL));
++				gpu.gpu_clock_speed = s.h_clock_mhz;
++				gpu.mem_used = (long long)s.mem_used_bytes;
++
++				if (gpu.supported_functions.pwr_usage and s.power_mw) {
++					gpu.pwr_usage = (long long)std::round(*s.power_mw);
++					gpu.pwr_max_usage = std::max(gpu.pwr_max_usage, gpu.pwr_usage);
++					if (gpu.pwr_max_usage > 0)
++						gpu.gpu_percent.at("gpu-pwr-totals").push_back(
++							std::clamp((long long)std::round((double)gpu.pwr_usage * 100.0 / (double)gpu.pwr_max_usage), 0LL, 100LL));
++				}
++			}
++			return true;
++		}
++
++		template bool collect<0>(gpu_info*);
++		template bool collect<1>(gpu_info*);
++	}
++
+ 	//? Collect data from GPU-specific libraries
+ 	auto collect(bool no_update) -> vector<gpu_info>& {
+ 		if (Runner::stopping or (no_update and not gpus.empty())) return gpus;
+@@ -2222,6 +2324,7 @@ namespace Gpu {
+ 		Rsmi::collect<0>(gpus.data() + Nvml::device_count); // size = Rsmi::device_count
+ 		Asysfs::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count); // size = Asysfs::device_count
+ 		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count); // size = Intel::device_count
++		Xdna::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Intel::device_count); // size = Xdna::device_count
+ 
+ 		//* Calculate average usage
+ 		long long avg = 0;
+diff --git a/src/linux/xdna/amdxdna_accel.h b/src/linux/xdna/amdxdna_accel.h
+new file mode 100644
+index 0000000..4e8a3db
+--- /dev/null
++++ b/src/linux/xdna/amdxdna_accel.h
+@@ -0,0 +1,743 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Copyright (C) 2022-2024, Advanced Micro Devices, Inc.
++ */
++
++#ifndef _AMDXDNA_ACCEL_H_
++#define _AMDXDNA_ACCEL_H_
++
++#include <linux/stddef.h>
++#include <drm/drm.h>
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++#define AMDXDNA_INVALID_CMD_HANDLE	(~0UL)
++#define AMDXDNA_INVALID_ADDR		(~0UL)
++#define AMDXDNA_INVALID_CTX_HANDLE	0
++#define AMDXDNA_INVALID_BO_HANDLE	0
++#define AMDXDNA_INVALID_FENCE_HANDLE	0
++
++/*
++ * Define hardware context priority
++ */
++#define AMDXDNA_QOS_REALTIME_PRIORITY	0x100
++#define AMDXDNA_QOS_HIGH_PRIORITY	0x180
++#define AMDXDNA_QOS_NORMAL_PRIORITY	0x200
++#define AMDXDNA_QOS_LOW_PRIORITY	0x280
++
++enum amdxdna_device_type {
++	AMDXDNA_DEV_TYPE_UNKNOWN = -1,
++	AMDXDNA_DEV_TYPE_KMQ,
++};
++
++enum amdxdna_drm_ioctl_id {
++	DRM_AMDXDNA_CREATE_HWCTX,
++	DRM_AMDXDNA_DESTROY_HWCTX,
++	DRM_AMDXDNA_CONFIG_HWCTX,
++	DRM_AMDXDNA_CREATE_BO,
++	DRM_AMDXDNA_GET_BO_INFO,
++	DRM_AMDXDNA_SYNC_BO,
++	DRM_AMDXDNA_EXEC_CMD,
++	DRM_AMDXDNA_GET_INFO,
++	DRM_AMDXDNA_SET_STATE,
++	DRM_AMDXDNA_GET_ARRAY = 10,
++};
++
++/**
++ * struct qos_info - QoS information for driver.
++ * @gops: Giga operations per second.
++ * @fps: Frames per second.
++ * @dma_bandwidth: DMA bandwidtha.
++ * @latency: Frame response latency.
++ * @frame_exec_time: Frame execution time.
++ * @priority: Request priority.
++ *
++ * User program can provide QoS hints to driver.
++ */
++struct amdxdna_qos_info {
++	__u32 gops;
++	__u32 fps;
++	__u32 dma_bandwidth;
++	__u32 latency;
++	__u32 frame_exec_time;
++	__u32 priority;
++};
++
++/**
++ * struct amdxdna_drm_create_hwctx - Create hardware context.
++ * @ext: MBZ.
++ * @ext_flags: MBZ.
++ * @qos_p: Address of QoS info.
++ * @umq_bo: BO handle for user mode queue(UMQ).
++ * @log_buf_bo: BO handle for log buffer.
++ * @max_opc: Maximum operations per cycle.
++ * @num_tiles: Number of AIE tiles.
++ * @mem_size: Size of AIE tile memory.
++ * @umq_doorbell: Returned offset of doorbell associated with UMQ.
++ * @handle: Returned hardware context handle.
++ * @syncobj_handle: Returned syncobj handle for command completion.
++ */
++struct amdxdna_drm_create_hwctx {
++	__u64 ext;
++	__u64 ext_flags;
++	__u64 qos_p;
++	__u32 umq_bo;
++	__u32 log_buf_bo;
++	__u32 max_opc;
++	__u32 num_tiles;
++	__u32 mem_size;
++	__u32 umq_doorbell;
++	__u32 handle;
++	__u32 syncobj_handle;
++};
++
++/**
++ * struct amdxdna_drm_destroy_hwctx - Destroy hardware context.
++ * @handle: Hardware context handle.
++ * @pad: MBZ.
++ */
++struct amdxdna_drm_destroy_hwctx {
++	__u32 handle;
++	__u32 pad;
++};
++
++/**
++ * struct amdxdna_cu_config - configuration for one CU
++ * @cu_bo: CU configuration buffer bo handle.
++ * @cu_func: Function of a CU.
++ * @pad: MBZ.
++ */
++struct amdxdna_cu_config {
++	__u32 cu_bo;
++	__u8  cu_func;
++	__u8  pad[3];
++};
++
++/**
++ * struct amdxdna_hwctx_param_config_cu - configuration for CUs in hardware context
++ * @num_cus: Number of CUs to configure.
++ * @pad: MBZ.
++ * @cu_configs: Array of CU configurations of struct amdxdna_cu_config.
++ */
++struct amdxdna_hwctx_param_config_cu {
++	__u16 num_cus;
++	__u16 pad[3];
++	struct amdxdna_cu_config cu_configs[] __counted_by(num_cus);
++};
++
++enum amdxdna_drm_config_hwctx_param {
++	DRM_AMDXDNA_HWCTX_CONFIG_CU,
++	DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF,
++	DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF,
++};
++
++/**
++ * struct amdxdna_drm_config_hwctx - Configure hardware context.
++ * @handle: hardware context handle.
++ * @param_type: Value in enum amdxdna_drm_config_hwctx_param. Specifies the
++ *              structure passed in via param_val.
++ * @param_val: A structure specified by the param_type struct member.
++ * @param_val_size: Size of the parameter buffer pointed to by the param_val.
++ *		    If param_val is not a pointer, driver can ignore this.
++ * @pad: MBZ.
++ *
++ * Note: if the param_val is a pointer pointing to a buffer, the maximum size
++ * of the buffer is 4KiB(PAGE_SIZE).
++ */
++struct amdxdna_drm_config_hwctx {
++	__u32 handle;
++	__u32 param_type;
++	__u64 param_val;
++	__u32 param_val_size;
++	__u32 pad;
++};
++
++enum amdxdna_bo_type {
++	AMDXDNA_BO_INVALID = 0,
++	AMDXDNA_BO_SHMEM = 1, /* Be compatible with legacy application code. */
++	AMDXDNA_BO_SHARE = 1,
++	AMDXDNA_BO_DEV_HEAP = 2,
++	AMDXDNA_BO_DEV = 3,
++	AMDXDNA_BO_CMD = 4,
++};
++
++/**
++ * struct amdxdna_drm_va_entry
++ * @vaddr: Virtual address.
++ * @len: Size of entry.
++ */
++struct amdxdna_drm_va_entry {
++	__u64 vaddr;
++	__u64 len;
++};
++
++/**
++ * struct amdxdna_drm_va_tbl
++ * @dmabuf_fd: The fd of dmabuf.
++ * @num_entries: Number of va entries.
++ * @va_entries: Array of va entries.
++ *
++ * The input can be either a dmabuf fd or a virtual address entry table.
++ * When dmabuf_fd is used, num_entries must be zero.
++ */
++struct amdxdna_drm_va_tbl {
++	__s32 dmabuf_fd;
++	__u32 num_entries;
++	struct amdxdna_drm_va_entry va_entries[];
++};
++
++/**
++ * struct amdxdna_drm_create_bo - Create a buffer object.
++ * @flags: Buffer flags. MBZ.
++ * @vaddr: User VA of buffer if applied. MBZ.
++ * @size: Size in bytes.
++ * @type: Buffer type.
++ * @handle: Returned DRM buffer object handle.
++ */
++struct amdxdna_drm_create_bo {
++	__u64	flags;
++	__u64	vaddr;
++	__u64	size;
++	__u32	type;
++	__u32	handle;
++};
++
++/**
++ * struct amdxdna_drm_get_bo_info - Get buffer object information.
++ * @ext: MBZ.
++ * @ext_flags: MBZ.
++ * @handle: DRM buffer object handle.
++ * @pad: MBZ.
++ * @map_offset: Returned DRM fake offset for mmap().
++ * @vaddr: Returned user VA of buffer. 0 in case user needs mmap().
++ * @xdna_addr: Returned XDNA device virtual address.
++ */
++struct amdxdna_drm_get_bo_info {
++	__u64 ext;
++	__u64 ext_flags;
++	__u32 handle;
++	__u32 pad;
++	__u64 map_offset;
++	__u64 vaddr;
++	__u64 xdna_addr;
++};
++
++/**
++ * struct amdxdna_drm_sync_bo - Sync buffer object.
++ * @handle: Buffer object handle.
++ * @direction: Direction of sync, can be from device or to device.
++ * @offset: Offset in the buffer to sync.
++ * @size: Size in bytes.
++ */
++struct amdxdna_drm_sync_bo {
++	__u32 handle;
++#define SYNC_DIRECT_TO_DEVICE	0U
++#define SYNC_DIRECT_FROM_DEVICE	1U
++	__u32 direction;
++	__u64 offset;
++	__u64 size;
++};
++
++enum amdxdna_cmd_type {
++	AMDXDNA_CMD_SUBMIT_EXEC_BUF = 0,
++	AMDXDNA_CMD_SUBMIT_DEPENDENCY,
++	AMDXDNA_CMD_SUBMIT_SIGNAL,
++};
++
++/**
++ * struct amdxdna_drm_exec_cmd - Execute command.
++ * @ext: MBZ.
++ * @ext_flags: MBZ.
++ * @hwctx: Hardware context handle.
++ * @type: One of command type in enum amdxdna_cmd_type.
++ * @cmd_handles: Array of command handles or the command handle itself
++ *               in case of just one.
++ * @args: Array of arguments for all command handles.
++ * @cmd_count: Number of command handles in the cmd_handles array.
++ * @arg_count: Number of arguments in the args array.
++ * @seq: Returned sequence number for this command.
++ */
++struct amdxdna_drm_exec_cmd {
++	__u64 ext;
++	__u64 ext_flags;
++	__u32 hwctx;
++	__u32 type;
++	__u64 cmd_handles;
++	__u64 args;
++	__u32 cmd_count;
++	__u32 arg_count;
++	__u64 seq;
++};
++
++/**
++ * struct amdxdna_drm_query_aie_status - Query the status of the AIE hardware
++ * @buffer: The user space buffer that will return the AIE status.
++ * @buffer_size: The size of the user space buffer.
++ * @cols_filled: A bitmap of AIE columns whose data has been returned in the buffer.
++ */
++struct amdxdna_drm_query_aie_status {
++	__u64 buffer; /* out */
++	__u32 buffer_size; /* in */
++	__u32 cols_filled; /* out */
++};
++
++/**
++ * struct amdxdna_drm_query_aie_version - Query the version of the AIE hardware
++ * @major: The major version number.
++ * @minor: The minor version number.
++ */
++struct amdxdna_drm_query_aie_version {
++	__u32 major; /* out */
++	__u32 minor; /* out */
++};
++
++/**
++ * struct amdxdna_drm_query_aie_tile_metadata - Query the metadata of AIE tile (core, mem, shim)
++ * @row_count: The number of rows.
++ * @row_start: The starting row number.
++ * @dma_channel_count: The number of dma channels.
++ * @lock_count: The number of locks.
++ * @event_reg_count: The number of events.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_query_aie_tile_metadata {
++	__u16 row_count;
++	__u16 row_start;
++	__u16 dma_channel_count;
++	__u16 lock_count;
++	__u16 event_reg_count;
++	__u16 pad[3];
++};
++
++/**
++ * struct amdxdna_drm_query_aie_metadata - Query the metadata of the AIE hardware
++ * @col_size: The size of a column in bytes.
++ * @cols: The total number of columns.
++ * @rows: The total number of rows.
++ * @version: The version of the AIE hardware.
++ * @core: The metadata for all core tiles.
++ * @mem: The metadata for all mem tiles.
++ * @shim: The metadata for all shim tiles.
++ */
++struct amdxdna_drm_query_aie_metadata {
++	__u32 col_size;
++	__u16 cols;
++	__u16 rows;
++	struct amdxdna_drm_query_aie_version version;
++	struct amdxdna_drm_query_aie_tile_metadata core;
++	struct amdxdna_drm_query_aie_tile_metadata mem;
++	struct amdxdna_drm_query_aie_tile_metadata shim;
++};
++
++/**
++ * struct amdxdna_drm_query_clock - Metadata for a clock
++ * @name: The clock name.
++ * @freq_mhz: The clock frequency.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_query_clock {
++	__u8 name[16];
++	__u32 freq_mhz;
++	__u32 pad;
++};
++
++/**
++ * struct amdxdna_drm_query_clock_metadata - Query metadata for clocks
++ * @mp_npu_clock: The metadata for MP-NPU clock.
++ * @h_clock: The metadata for H clock.
++ */
++struct amdxdna_drm_query_clock_metadata {
++	struct amdxdna_drm_query_clock mp_npu_clock;
++	struct amdxdna_drm_query_clock h_clock;
++};
++
++enum amdxdna_sensor_type {
++	AMDXDNA_SENSOR_TYPE_POWER,
++	AMDXDNA_SENSOR_TYPE_COLUMN_UTILIZATION
++};
++
++/**
++ * struct amdxdna_drm_query_sensor - The data for single sensor.
++ * @label: The name for a sensor.
++ * @input: The current value of the sensor.
++ * @max: The maximum value possible for the sensor.
++ * @average: The average value of the sensor.
++ * @highest: The highest recorded sensor value for this driver load for the sensor.
++ * @status: The sensor status.
++ * @units: The sensor units.
++ * @unitm: Translates value member variables into the correct unit via (pow(10, unitm) * value).
++ * @type: The sensor type from enum amdxdna_sensor_type.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_query_sensor {
++	__u8  label[64];
++	__u32 input;
++	__u32 max;
++	__u32 average;
++	__u32 highest;
++	__u8  status[64];
++	__u8  units[16];
++	__s8  unitm;
++	__u8  type;
++	__u8  pad[6];
++};
++
++/**
++ * struct amdxdna_drm_query_hwctx - The data for single context.
++ * @context_id: The ID for this context.
++ * @start_col: The starting column for the partition assigned to this context.
++ * @num_col: The number of columns in the partition assigned to this context.
++ * @pad: Structure padding.
++ * @pid: The Process ID of the process that created this context.
++ * @command_submissions: The number of commands submitted to this context.
++ * @command_completions: The number of commands completed by this context.
++ * @migrations: The number of times this context has been moved to a different partition.
++ * @preemptions: The number of times this context has been preempted by another context in the
++ *               same partition.
++ * @errors: The errors for this context.
++ */
++struct amdxdna_drm_query_hwctx {
++	__u32 context_id;
++	__u32 start_col;
++	__u32 num_col;
++	__u32 pad;
++	__s64 pid;
++	__u64 command_submissions;
++	__u64 command_completions;
++	__u64 migrations;
++	__u64 preemptions;
++	__u64 errors;
++};
++
++enum amdxdna_power_mode_type {
++	POWER_MODE_DEFAULT, /* Fallback to calculated DPM */
++	POWER_MODE_LOW,     /* Set frequency to lowest DPM */
++	POWER_MODE_MEDIUM,  /* Set frequency to medium DPM */
++	POWER_MODE_HIGH,    /* Set frequency to highest DPM */
++	POWER_MODE_TURBO,   /* Maximum power */
++};
++
++/**
++ * struct amdxdna_drm_get_power_mode - Get the configured power mode
++ * @power_mode: The mode type from enum amdxdna_power_mode_type
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_get_power_mode {
++	__u8 power_mode;
++	__u8 pad[7];
++};
++
++/**
++ * struct amdxdna_drm_query_firmware_version - Query the firmware version
++ * @major: The major version number
++ * @minor: The minor version number
++ * @patch: The patch level version number
++ * @build: The build ID
++ */
++struct amdxdna_drm_query_firmware_version {
++	__u32 major; /* out */
++	__u32 minor; /* out */
++	__u32 patch; /* out */
++	__u32 build; /* out */
++};
++
++enum amdxdna_drm_get_param {
++	DRM_AMDXDNA_QUERY_AIE_STATUS,
++	DRM_AMDXDNA_QUERY_AIE_METADATA,
++	DRM_AMDXDNA_QUERY_AIE_VERSION,
++	DRM_AMDXDNA_QUERY_CLOCK_METADATA,
++	DRM_AMDXDNA_QUERY_SENSORS,
++	DRM_AMDXDNA_QUERY_HW_CONTEXTS,
++	DRM_AMDXDNA_QUERY_FIRMWARE_VERSION = 8,
++	DRM_AMDXDNA_GET_POWER_MODE,
++	DRM_AMDXDNA_QUERY_TELEMETRY,
++	DRM_AMDXDNA_GET_FORCE_PREEMPT_STATE,
++	DRM_AMDXDNA_QUERY_RESOURCE_INFO,
++	DRM_AMDXDNA_GET_FRAME_BOUNDARY_PREEMPT_STATE,
++};
++
++/**
++ * struct amdxdna_drm_get_resource_info - Get resource information
++ */
++struct amdxdna_drm_get_resource_info {
++	/** @npu_clk_max: max H-Clocks */
++	__u64 npu_clk_max;
++	/** @npu_tops_max: max TOPs */
++	__u64 npu_tops_max;
++	/** @npu_task_max: max number of tasks */
++	__u64 npu_task_max;
++	/** @npu_tops_curr: current TOPs */
++	__u64 npu_tops_curr;
++	/** @npu_task_curr: current number of tasks */
++	__u64 npu_task_curr;
++};
++
++/**
++ * struct amdxdna_drm_attribute_state - State of an attribute
++ */
++struct amdxdna_drm_attribute_state {
++	/** @state: enabled or disabled */
++	__u8 state;
++	/** @pad: MBZ */
++	__u8 pad[7];
++};
++
++/**
++ * struct amdxdna_drm_query_telemetry_header - Telemetry data header
++ */
++struct amdxdna_drm_query_telemetry_header {
++	/** @major: Firmware telemetry interface major version number */
++	__u32 major;
++	/** @minor: Firmware telemetry interface minor version number */
++	__u32 minor;
++	/** @type: Telemetry query type */
++	__u32 type;
++	/** @map_num_elements: Total number of elements in the map table */
++	__u32 map_num_elements;
++	/** @map: Element map */
++	__u32 map[];
++};
++
++/**
++ * struct amdxdna_drm_get_info - Get some information from the AIE hardware.
++ * @param: Value in enum amdxdna_drm_get_param. Specifies the structure passed in the buffer.
++ * @buffer_size: Size of the input buffer. Size needed/written by the kernel.
++ * @buffer: A structure specified by the param struct member.
++ */
++struct amdxdna_drm_get_info {
++	__u32 param; /* in */
++	__u32 buffer_size; /* in/out */
++	__u64 buffer; /* in/out */
++};
++
++#define AMDXDNA_HWCTX_STATE_IDLE	0
++#define AMDXDNA_HWCTX_STATE_ACTIVE	1
++
++/**
++ * struct amdxdna_drm_hwctx_entry - The hardware context array entry
++ */
++struct amdxdna_drm_hwctx_entry {
++	/** @context_id: Context ID. */
++	__u32 context_id;
++	/** @start_col: Start AIE array column assigned to context. */
++	__u32 start_col;
++	/** @num_col: Number of AIE array columns assigned to context. */
++	__u32 num_col;
++	/** @hwctx_id: The real hardware context id. */
++	__u32 hwctx_id;
++	/** @pid: ID of process which created this context. */
++	__s64 pid;
++	/** @command_submissions: Number of commands submitted. */
++	__u64 command_submissions;
++	/** @command_completions: Number of commands completed. */
++	__u64 command_completions;
++	/** @migrations: Number of times been migrated. */
++	__u64 migrations;
++	/** @preemptions: Number of times been preempted. */
++	__u64 preemptions;
++	/** @errors: Number of errors happened. */
++	__u64 errors;
++	/** @priority: Context priority. */
++	__u64 priority;
++	/** @heap_usage: Usage of device heap buffer. */
++	__u64 heap_usage;
++	/** @suspensions: Number of times been suspended. */
++	__u64 suspensions;
++	/**
++	 * @state: Context state.
++	 * %AMDXDNA_HWCTX_STATE_IDLE
++	 * %AMDXDNA_HWCTX_STATE_ACTIVE
++	 */
++	__u32 state;
++	/** @pasid: PASID been bound. */
++	__u32 pasid;
++	/** @gops: Giga operations per second. */
++	__u32 gops;
++	/** @fps: Frames per second. */
++	__u32 fps;
++	/** @dma_bandwidth: DMA bandwidth. */
++	__u32 dma_bandwidth;
++	/** @latency: Frame response latency. */
++	__u32 latency;
++	/** @frame_exec_time: Frame execution time. */
++	__u32 frame_exec_time;
++	/** @txn_op_idx: Index of last control code executed. */
++	__u32 txn_op_idx;
++	/** @ctx_pc: Program counter. */
++	__u32 ctx_pc;
++	/** @fatal_error_type: Fatal error type if context crashes. */
++	__u32 fatal_error_type;
++	/** @fatal_error_exception_type: Firmware exception type. */
++	__u32 fatal_error_exception_type;
++	/** @fatal_error_exception_pc: Firmware exception program counter. */
++	__u32 fatal_error_exception_pc;
++	/** @fatal_error_app_module: Exception module name. */
++	__u32 fatal_error_app_module;
++	/** @pad: Structure pad. */
++	__u32 pad;
++};
++
++/**
++ * struct amdxdna_async_error - XDNA async error structure
++ */
++struct amdxdna_async_error {
++	/** @err_code: Error code. */
++	__u64 err_code;
++	/** @ts_us: Timestamp. */
++	__u64 ts_us;
++	/** @ex_err_code: Extra error code */
++	__u64 ex_err_code;
++};
++
++/**
++ * struct amdxdna_drm_bo_usage - all types of BO usage
++ * BOs managed by XRT/SHIM/driver is counted as internal.
++ * Others are counted as external which are managed by applications.
++ *
++ * Among all types of BOs:
++ *   AMDXDNA_BO_DEV_HEAP - is counted for internal.
++ *   AMDXDNA_BO_SHARE    - is counted for external.
++ *   AMDXDNA_BO_CMD      - is counted for internal.
++ *   AMDXDNA_BO_DEV      - is counted by heap_usage only, not internal
++ *                         or external. It does not add to the total memory
++ *                         footprint since its mem comes from heap which is
++ *                         already counted as internal.
++ */
++struct amdxdna_drm_bo_usage {
++	/** @pid: The ID of the process to query from. */
++	__s64 pid;
++	/** @total_usage: Total BO size used by process. */
++	__u64 total_usage;
++	/** @internal_usage: Total internal BO size used by process. */
++	__u64 internal_usage;
++	/** @heap_usage: Total device BO size used by process. */
++	__u64 heap_usage;
++};
++
++/*
++ * Supported params in struct amdxdna_drm_get_array
++ */
++#define DRM_AMDXDNA_HW_CONTEXT_ALL	0
++#define DRM_AMDXDNA_HW_LAST_ASYNC_ERR	2
++#define DRM_AMDXDNA_BO_USAGE		6
++
++/**
++ * struct amdxdna_drm_get_array - Get information array.
++ */
++struct amdxdna_drm_get_array {
++	/**
++	 * @param:
++	 *
++	 * Supported params:
++	 *
++	 * %DRM_AMDXDNA_HW_CONTEXT_ALL:
++	 * Returns all created hardware contexts.
++	 *
++	 * %DRM_AMDXDNA_HW_LAST_ASYNC_ERR:
++	 * Returns last async error.
++	 *
++	 * %DRM_AMDXDNA_BO_USAGE:
++	 * Returns usage of heap/internal/external BOs.
++	 */
++	__u32 param;
++	/**
++	 * @element_size:
++	 *
++	 * Specifies maximum element size and returns the actual element size.
++	 */
++	__u32 element_size;
++	/**
++	 * @num_element:
++	 *
++	 * Specifies maximum number of elements and returns the actual number
++	 * of elements.
++	 */
++	__u32 num_element; /* in/out */
++	/** @pad: MBZ */
++	__u32 pad;
++	/**
++	 * @buffer:
++	 *
++	 * Specifies the match conditions and returns the matched information
++	 * array.
++	 */
++	__u64 buffer;
++};
++
++enum amdxdna_drm_set_param {
++	DRM_AMDXDNA_SET_POWER_MODE,
++	DRM_AMDXDNA_WRITE_AIE_MEM,
++	DRM_AMDXDNA_WRITE_AIE_REG,
++	DRM_AMDXDNA_SET_FORCE_PREEMPT,
++	DRM_AMDXDNA_SET_FRAME_BOUNDARY_PREEMPT,
++};
++
++/**
++ * struct amdxdna_drm_set_state - Set the state of the AIE hardware.
++ * @param: Value in enum amdxdna_drm_set_param.
++ * @buffer_size: Size of the input param.
++ * @buffer: Pointer to the input param.
++ */
++struct amdxdna_drm_set_state {
++	__u32 param; /* in */
++	__u32 buffer_size; /* in */
++	__u64 buffer; /* in */
++};
++
++/**
++ * struct amdxdna_drm_set_power_mode - Set the power mode of the AIE hardware
++ * @power_mode: The sensor type from enum amdxdna_power_mode_type
++ * @pad: MBZ.
++ */
++struct amdxdna_drm_set_power_mode {
++	__u8 power_mode;
++	__u8 pad[7];
++};
++
++#define DRM_IOCTL_AMDXDNA_CREATE_HWCTX \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CREATE_HWCTX, \
++		 struct amdxdna_drm_create_hwctx)
++
++#define DRM_IOCTL_AMDXDNA_DESTROY_HWCTX \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_DESTROY_HWCTX, \
++		 struct amdxdna_drm_destroy_hwctx)
++
++#define DRM_IOCTL_AMDXDNA_CONFIG_HWCTX \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CONFIG_HWCTX, \
++		 struct amdxdna_drm_config_hwctx)
++
++#define DRM_IOCTL_AMDXDNA_CREATE_BO \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CREATE_BO, \
++		 struct amdxdna_drm_create_bo)
++
++#define DRM_IOCTL_AMDXDNA_GET_BO_INFO \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_BO_INFO, \
++		 struct amdxdna_drm_get_bo_info)
++
++#define DRM_IOCTL_AMDXDNA_SYNC_BO \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_SYNC_BO, \
++		 struct amdxdna_drm_sync_bo)
++
++#define DRM_IOCTL_AMDXDNA_EXEC_CMD \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_EXEC_CMD, \
++		 struct amdxdna_drm_exec_cmd)
++
++#define DRM_IOCTL_AMDXDNA_GET_INFO \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_INFO, \
++		 struct amdxdna_drm_get_info)
++
++#define DRM_IOCTL_AMDXDNA_SET_STATE \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_SET_STATE, \
++		 struct amdxdna_drm_set_state)
++
++#define DRM_IOCTL_AMDXDNA_GET_ARRAY \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_ARRAY, \
++		 struct amdxdna_drm_get_array)
++
++#if defined(__cplusplus)
++} /* extern c end */
++#endif
++
++#endif /* _AMDXDNA_ACCEL_H_ */
+diff --git a/src/linux/xdna/xdna_telemetry.hpp b/src/linux/xdna/xdna_telemetry.hpp
+new file mode 100644
+index 0000000..d6ae48a
+--- /dev/null
++++ b/src/linux/xdna/xdna_telemetry.hpp
+@@ -0,0 +1,518 @@
++// SPDX-License-Identifier: MIT
++//
++// xdna_telemetry.hpp — header-only C++20 telemetry reader for AMD XDNA NPUs
++// (Phoenix / Hawk Point "npu1", PCI 1022:1502; Strix "npu4+", PCI 1022:17f0).
++//
++// Talks to the in-tree `amdxdna` kernel driver through /dev/accel/accelN and
++// /sys/class/accel/accelN. No XRT, ROCm or libdrm dependency.
++//
++// Data sources, in order of preference:
++//   * DRM_AMDXDNA_QUERY_AIE_METADATA / CLOCK_METADATA / FIRMWARE_VERSION (GET_INFO)
++//   * DRM_AMDXDNA_QUERY_SENSORS (power + per-column utilisation) — only when the
++//     platform's amd-pmf exposes NPU metrics; returns ENODEV otherwise
++//   * DRM_IOCTL_AMDXDNA_GET_ARRAY: HW_CONTEXT_ALL (per-context column partition,
++//     state, command counters) and BO_USAGE (per-process buffer memory)
++//   * /proc/<pid>/fdinfo drm-* keys, if the driver ever exposes them
++//
++// Runtime PM: the NPU autosuspends ~5 s after its last job. Any GET_INFO ioctl
++// resumes it, so sample() first reads power/runtime_status and, while the
++// device is suspended, reports an idle sample without touching the device.
++// A 1 Hz poller therefore does not keep an idle NPU awake.
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#if __has_include(<drm/amdxdna_accel.h>) && !defined(XDNA_USE_VENDORED_UAPI)
++#include <drm/amdxdna_accel.h>
++#else
++#include "amdxdna_accel.h"
++#endif
++
++namespace xdna {
++
++namespace fs = std::filesystem;
++
++namespace detail {
++
++inline std::string read_line(const fs::path& p) {
++	std::ifstream f(p);
++	std::string s;
++	if (f) std::getline(f, s);
++	while (!s.empty() && (s.back() == '\n' || s.back() == ' ' || s.back() == '\r')) s.pop_back();
++	return s;
++}
++
++inline uint32_t read_hex(const fs::path& p) {
++	auto s = read_line(p);
++	if (s.empty()) return 0;
++	try { return static_cast<uint32_t>(std::stoul(s, nullptr, 16)); } catch (...) { return 0; }
++}
++
++template <size_t N>
++inline std::string cstr(const uint8_t (&a)[N]) {
++	size_t n = 0;
++	while (n < N && a[n] != 0) ++n;
++	return std::string(reinterpret_cast<const char*>(a), n);
++}
++
++inline uint64_t to_u64(const void* p) { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)); }
++
++} // namespace detail
++
++//* Static per-device information, read once.
++struct DeviceInfo {
++	int index = -1;               // N in accelN
++	fs::path dev_node;            // /dev/accel/accelN
++	fs::path sysfs;               // /sys/class/accel/accelN
++	uint16_t vendor = 0, device = 0;
++	std::string pci_slot;         // 0000:10:00.1
++	std::string name;             // human readable
++	std::string vbnv;             // e.g. RyzenAI-npu1
++	std::string fw_version;       // e.g. 1.5.5.391
++
++	// AIE array topology (from DRM_AMDXDNA_QUERY_AIE_METADATA)
++	uint16_t cols = 0, rows = 0;
++	uint16_t core_rows = 0, mem_rows = 0, shim_rows = 0;
++	uint32_t aie_major = 0, aie_minor = 0;
++	uint32_t col_size = 0;
++
++	uint64_t clk_max_mhz = 0;     // from QUERY_RESOURCE_INFO (0 if unsupported)
++	uint64_t tops_max = 0;
++	uint64_t task_max = 0;
++};
++
++//* One hardware context (a column partition owned by a process).
++struct HwContext {
++	uint32_t context_id = 0;
++	uint32_t hwctx_id = 0;
++	uint32_t start_col = 0, num_col = 0;
++	int64_t pid = 0;
++	uint64_t submissions = 0, completions = 0, errors = 0;
++	uint64_t heap_usage = 0;      // bytes
++	uint32_t state = 0;           // AMDXDNA_HWCTX_STATE_*
++	uint64_t priority = 0;
++	bool busy = false;            // derived: state ACTIVE or completions advanced since last sample
++};
++
++//* Per-process NPU memory usage (DRM_AMDXDNA_BO_USAGE).
++struct ProcUsage {
++	int64_t pid = 0;
++	std::string comm;
++	uint64_t total_bytes = 0, internal_bytes = 0, heap_bytes = 0;
++	uint32_t contexts = 0;
++};
++
++struct Sensor {
++	std::string label, units, status;
++	uint32_t input = 0, max = 0, average = 0, highest = 0;
++	int8_t unitm = 0;
++	uint8_t type = 0;
++	double value() const {
++		double v = input;
++		for (int i = 0; i < unitm; ++i) v *= 10.0;
++		for (int i = 0; i > unitm; --i) v /= 10.0;
++		return v;
++	}
++};
++
++enum class UtilSource { none, suspended, sensors, column_occupancy };
++
++inline const char* to_string(UtilSource s) {
++	switch (s) {
++		case UtilSource::suspended:        return "suspended";
++		case UtilSource::sensors:          return "column-sensors";
++		case UtilSource::column_occupancy: return "column-occupancy";
++		default:                           return "none";
++	}
++}
++
++//* A point-in-time sample.
++struct Sample {
++	std::chrono::steady_clock::time_point when{};
++	bool suspended = true;        // runtime PM state at sample time
++	std::string runtime_status;   // "active" / "suspended" / ...
++
++	uint32_t mp_npu_clock_mhz = 0;
++	uint32_t h_clock_mhz = 0;
++	std::optional<uint8_t> power_mode;
++
++	std::optional<double> power_mw;        // only with sensor support
++	std::vector<double> column_util_pct;   // only with sensor support, one per column
++
++	double util_pct = 0;          // 0..100, see util_source
++	UtilSource util_source = UtilSource::none;
++	uint32_t busy_cols = 0;
++
++	uint64_t tops_curr = 0, tasks_curr = 0;
++
++	std::vector<HwContext> contexts;
++	std::vector<ProcUsage> processes;
++	uint64_t mem_used_bytes = 0;  // sum of per-process total BO usage
++
++	std::vector<Sensor> sensors;
++
++	bool fresh = false;           // true if this sample issued ioctls; false = cached/idle
++};
++
++inline std::string device_name(uint16_t vendor, uint16_t device) {
++	if (vendor != 0x1022) return "Unknown accelerator";
++	switch (device) {
++		case 0x1502: return "AMD Ryzen AI NPU (XDNA1)";
++		case 0x17f0: return "AMD Ryzen AI NPU (XDNA2)";
++		default:     return "AMD NPU";
++	}
++}
++
++//* Enumerate /sys/class/accel/accel* bound to amdxdna.
++inline std::vector<DeviceInfo> discover(const fs::path& sys_root = "/sys/class/accel") {
++	std::vector<DeviceInfo> out;
++	std::error_code ec;
++	if (!fs::exists(sys_root, ec)) return out;
++	for (const auto& e : fs::directory_iterator(sys_root, ec)) {
++		auto fname = e.path().filename().string();
++		if (!fname.starts_with("accel")) continue;
++		auto drv = fs::read_symlink(e.path() / "device" / "driver", ec);
++		if (ec || drv.filename() != "amdxdna") { ec.clear(); continue; }
++		DeviceInfo d;
++		try { d.index = std::stoi(fname.substr(5)); } catch (...) { continue; }
++		d.sysfs = e.path();
++		d.dev_node = fs::path("/dev/accel") / fname;
++		d.vendor = static_cast<uint16_t>(detail::read_hex(e.path() / "device" / "vendor"));
++		d.device = static_cast<uint16_t>(detail::read_hex(e.path() / "device" / "device"));
++		d.pci_slot = fs::canonical(e.path() / "device", ec).filename().string();
++		d.vbnv = detail::read_line(e.path() / "device" / "vbnv");
++		d.fw_version = detail::read_line(e.path() / "device" / "fw_version");
++		d.name = device_name(d.vendor, d.device);
++		out.push_back(std::move(d));
++	}
++	std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.index < b.index; });
++	return out;
++}
++
++//* Read a process's comm, or "" if gone / not permitted.
++inline std::string proc_comm(int64_t pid) {
++	return detail::read_line(fs::path("/proc") / std::to_string(pid) / "comm");
++}
++
++//* PIDs holding an open fd to the given accel node (best effort; other users'
++//* processes are only visible to root).
++inline std::set<int64_t> pids_using(const fs::path& dev_node) {
++	std::set<int64_t> pids;
++	std::error_code ec;
++	auto target = fs::canonical(dev_node, ec);
++	if (ec) return pids;
++	for (const auto& p : fs::directory_iterator("/proc", ec)) {
++		const auto name = p.path().filename().string();
++		if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) continue;
++		std::error_code ec2;
++		for (const auto& fd : fs::directory_iterator(p.path() / "fd", ec2)) {
++			std::error_code ec3;
++			if (fs::read_symlink(fd.path(), ec3) == target) { pids.insert(std::stoll(name)); break; }
++		}
++	}
++	return pids;
++}
++
++class Device {
++public:
++	Device() = default;
++	explicit Device(DeviceInfo info) : info_(std::move(info)) {}
++	Device(const Device&) = delete;
++	Device& operator=(const Device&) = delete;
++	Device(Device&& o) noexcept { *this = std::move(o); }
++	Device& operator=(Device&& o) noexcept {
++		if (this != &o) {
++			close();
++			info_ = std::move(o.info_);
++			fd_ = std::exchange(o.fd_, -1);
++			prev_completions_ = std::move(o.prev_completions_);
++			sensors_supported_ = o.sensors_supported_;
++			idle_streak_ = o.idle_streak_;
++			was_suspended_ = o.was_suspended_;
++			last_query_ = o.last_query_;
++			last_mp_clk_ = o.last_mp_clk_;
++			last_h_clk_ = o.last_h_clk_;
++			last_processes_ = std::move(o.last_processes_);
++			idle_samples_before_backoff = o.idle_samples_before_backoff;
++			idle_backoff = o.idle_backoff;
++			last_error_ = std::move(o.last_error_);
++		}
++		return *this;
++	}
++	~Device() { close(); }
++
++	//* Open the device node and read static metadata. Returns false and sets
++	//* last_error() if the node cannot be opened (typically: not in `render` group).
++	bool open() {
++		if (fd_ >= 0) return true;
++		fd_ = ::open(info_.dev_node.c_str(), O_RDWR | O_CLOEXEC);
++		if (fd_ < 0) { last_error_ = info_.dev_node.string() + ": " + std::strerror(errno); return false; }
++
++		amdxdna_drm_query_aie_metadata md{};
++		if (get_info(DRM_AMDXDNA_QUERY_AIE_METADATA, &md, sizeof md)) {
++			info_.cols = md.cols;
++			info_.rows = md.rows;
++			info_.col_size = md.col_size;
++			info_.aie_major = md.version.major;
++			info_.aie_minor = md.version.minor;
++			info_.core_rows = md.core.row_count;
++			info_.mem_rows = md.mem.row_count;
++			info_.shim_rows = md.shim.row_count;
++		}
++		amdxdna_drm_query_firmware_version fw{};
++		if (get_info(DRM_AMDXDNA_QUERY_FIRMWARE_VERSION, &fw, sizeof fw))
++			info_.fw_version = std::to_string(fw.major) + "." + std::to_string(fw.minor) + "." +
++			                   std::to_string(fw.patch) + "." + std::to_string(fw.build);
++		amdxdna_drm_get_resource_info ri{};
++		if (get_info(DRM_AMDXDNA_QUERY_RESOURCE_INFO, &ri, sizeof ri)) {
++			info_.clk_max_mhz = ri.npu_clk_max;
++			info_.tops_max = ri.npu_tops_max;
++			info_.task_max = ri.npu_task_max;
++		}
++		return true;
++	}
++
++	void close() {
++		if (fd_ >= 0) ::close(fd_);
++		fd_ = -1;
++	}
++
++	bool is_open() const { return fd_ >= 0; }
++	const DeviceInfo& info() const { return info_; }
++	const std::string& last_error() const { return last_error_; }
++	int fd() const { return fd_; }
++
++	std::string runtime_status() const {
++		return detail::read_line(info_.sysfs / "device" / "power" / "runtime_status");
++	}
++
++	//* Take a sample. If `wake` is false (default) and the device is runtime-
++	//* suspended, no ioctl is issued and an idle sample is returned.
++	//* `extra_pids` are added to the BO-usage query (e.g. from pids_using()).
++	Sample sample(bool wake = false, const std::set<int64_t>& extra_pids = {}) {
++		Sample s;
++		s.when = std::chrono::steady_clock::now();
++		s.runtime_status = runtime_status();
++		s.suspended = (s.runtime_status == "suspended");
++		if (fd_ < 0) return s;
++		if (s.suspended && !wake) {
++			carry_over_processes(s);
++			s.util_source = UtilSource::suspended;
++			prev_completions_.clear();
++			idle_streak_ = 0;
++			was_suspended_ = true;
++			return s;
++		}
++		//* Every ioctl resets the autosuspend timer. After a few idle samples, only
++		//* re-query every idle_backoff so an otherwise idle NPU can suspend. A
++		//* suspended -> active transition is never caused by us (we don't query
++		//* while suspended), so it means a client started: query immediately.
++		if (was_suspended_) idle_streak_ = 0;
++		was_suspended_ = false;
++		if (!wake && idle_streak_ >= idle_samples_before_backoff &&
++		    s.when - last_query_ < idle_backoff) {
++			s.mp_npu_clock_mhz = last_mp_clk_;
++			s.h_clock_mhz = last_h_clk_;
++			s.util_source = sensors_supported_ ? UtilSource::sensors : UtilSource::column_occupancy;
++			carry_over_processes(s);
++			return s;
++		}
++		last_query_ = s.when;
++		s.fresh = true;
++
++		amdxdna_drm_query_clock_metadata ck{};
++		if (get_info(DRM_AMDXDNA_QUERY_CLOCK_METADATA, &ck, sizeof ck)) {
++			s.mp_npu_clock_mhz = ck.mp_npu_clock.freq_mhz;
++			s.h_clock_mhz = ck.h_clock.freq_mhz;
++		}
++		amdxdna_drm_get_power_mode pm{};
++		if (get_info(DRM_AMDXDNA_GET_POWER_MODE, &pm, sizeof pm)) s.power_mode = pm.power_mode;
++		amdxdna_drm_get_resource_info ri{};
++		if (get_info(DRM_AMDXDNA_QUERY_RESOURCE_INFO, &ri, sizeof ri)) {
++			s.tops_curr = ri.npu_tops_curr;
++			s.tasks_curr = ri.npu_task_curr;
++		}
++
++		read_sensors(s);
++		read_contexts(s);
++
++		//* Utilisation: real column sensors when present, else column occupancy
++		//* (columns owned by contexts that are ACTIVE or completed work since the
++		//* last sample, divided by total columns).
++		const uint32_t cols = info_.cols ? info_.cols : 1;
++		if (!s.column_util_pct.empty()) {
++			double sum = 0;
++			for (double v : s.column_util_pct) sum += v;
++			s.util_pct = sum / static_cast<double>(s.column_util_pct.size());
++			s.util_source = UtilSource::sensors;
++		} else {
++			std::vector<bool> busy(cols, false);
++			for (const auto& c : s.contexts)
++				if (c.busy)
++					for (uint32_t i = c.start_col; i < c.start_col + c.num_col && i < cols; ++i) busy[i] = true;
++			for (bool b : busy) s.busy_cols += b;
++			s.util_pct = 100.0 * s.busy_cols / cols;
++			s.util_source = UtilSource::column_occupancy;
++		}
++
++		std::set<int64_t> pids = extra_pids;
++		for (const auto& c : s.contexts) pids.insert(c.pid);
++		read_bo_usage(s, pids);
++
++		last_processes_ = s.processes;
++		last_mp_clk_ = s.mp_npu_clock_mhz;
++		last_h_clk_ = s.h_clock_mhz;
++		idle_streak_ = s.util_pct > 0 ? 0 : idle_streak_ + 1;
++		return s;
++	}
++
++	//* Back-off tuning (see sample()). Defaults suit a 1 s refresh and the
++	//* driver's 5 s autosuspend delay.
++	int idle_samples_before_backoff = 3;
++	std::chrono::steady_clock::duration idle_backoff = std::chrono::seconds(10);
++
++	bool sensors_supported() const { return sensors_supported_; }
++
++	//* Raw GET_INFO wrapper. Returns true on success.
++	bool get_info(uint32_t param, void* buf, uint32_t size, uint32_t* out_size = nullptr) const {
++		amdxdna_drm_get_info gi{};
++		gi.param = param;
++		gi.buffer_size = size;
++		gi.buffer = detail::to_u64(buf);
++		const int r = ::ioctl(fd_, DRM_IOCTL_AMDXDNA_GET_INFO, &gi);
++		if (out_size) *out_size = gi.buffer_size;
++		return r == 0;
++	}
++
++	//* Raw GET_ARRAY wrapper. Returns number of elements, or -errno.
++	long get_array(uint32_t param, void* buf, uint32_t elem_size, uint32_t max_elems) const {
++		amdxdna_drm_get_array ga{};
++		ga.param = param;
++		ga.element_size = elem_size;
++		ga.num_element = max_elems;
++		ga.buffer = detail::to_u64(buf);
++		if (::ioctl(fd_, DRM_IOCTL_AMDXDNA_GET_ARRAY, &ga) != 0) return -errno;
++		return ga.num_element;
++	}
++
++private:
++	//* BOs survive runtime suspend, so keep reporting the last-known usage of
++	//* processes that are still alive when we skip the ioctls.
++	void carry_over_processes(Sample& s) {
++		std::error_code ec;
++		std::erase_if(last_processes_, [&](const ProcUsage& p) {
++			return !fs::exists(fs::path("/proc") / std::to_string(p.pid), ec);
++		});
++		s.processes = last_processes_;
++		for (auto& p : s.processes) { p.contexts = 0; s.mem_used_bytes += p.total_bytes; }
++	}
++
++	void read_sensors(Sample& s) {
++		if (!sensors_supported_) return;
++		std::array<amdxdna_drm_query_sensor, 32> buf{};
++		uint32_t got = 0;
++		if (!get_info(DRM_AMDXDNA_QUERY_SENSORS, buf.data(), sizeof buf, &got)) {
++			//* ENODEV/EOPNOTSUPP/EINVAL: platform has no PMF NPU metrics. Stop asking.
++			if (errno == ENODEV || errno == EOPNOTSUPP || errno == EINVAL) sensors_supported_ = false;
++			return;
++		}
++		const size_t n = std::min<size_t>(got / sizeof(amdxdna_drm_query_sensor), buf.size());
++		for (size_t i = 0; i < n; ++i) {
++			const auto& r = buf[i];
++			Sensor x;
++			x.label = detail::cstr(r.label);
++			x.units = detail::cstr(r.units);
++			x.status = detail::cstr(r.status);
++			x.input = r.input; x.max = r.max; x.average = r.average; x.highest = r.highest;
++			x.unitm = r.unitm; x.type = r.type;
++			if (r.type == AMDXDNA_SENSOR_TYPE_POWER) {
++				double v = x.value();                    // in `units`
++				if (x.units == "W") v *= 1000.0;
++				else if (x.units == "uW") v /= 1000.0;
++				s.power_mw = v;
++			} else if (r.type == AMDXDNA_SENSOR_TYPE_COLUMN_UTILIZATION) {
++				s.column_util_pct.push_back(std::clamp(x.value(), 0.0, 100.0));
++			}
++			s.sensors.push_back(std::move(x));
++		}
++	}
++
++	void read_contexts(Sample& s) {
++		std::vector<amdxdna_drm_hwctx_entry> buf(64);
++		const long n = get_array(DRM_AMDXDNA_HW_CONTEXT_ALL, buf.data(), sizeof(amdxdna_drm_hwctx_entry),
++		                         static_cast<uint32_t>(buf.size()));
++		std::map<uint64_t, uint64_t> next;
++		for (long i = 0; i < n; ++i) {
++			const auto& e = buf[static_cast<size_t>(i)];
++			HwContext c;
++			c.context_id = e.context_id;
++			c.hwctx_id = e.hwctx_id;
++			c.start_col = e.start_col;
++			c.num_col = e.num_col;
++			c.pid = e.pid;
++			c.submissions = e.command_submissions;
++			c.completions = e.command_completions;
++			c.errors = e.errors;
++			c.heap_usage = e.heap_usage;
++			c.state = e.state;
++			c.priority = e.priority;
++			const uint64_t key = (static_cast<uint64_t>(e.pid) << 32) | e.context_id;
++			auto it = prev_completions_.find(key);
++			const bool advanced = it != prev_completions_.end() && e.command_completions > it->second;
++			const bool pending = e.command_submissions > e.command_completions;
++			c.busy = e.state == AMDXDNA_HWCTX_STATE_ACTIVE || advanced || pending;
++			next[key] = e.command_completions;
++			s.contexts.push_back(c);
++		}
++		prev_completions_ = std::move(next);
++	}
++
++	void read_bo_usage(Sample& s, const std::set<int64_t>& pids) {
++		for (int64_t pid : pids) {
++			amdxdna_drm_bo_usage u{};
++			u.pid = pid;
++			if (get_array(DRM_AMDXDNA_BO_USAGE, &u, sizeof u, 1) < 0) continue;
++			ProcUsage p;
++			p.pid = pid;
++			p.comm = proc_comm(pid);
++			p.total_bytes = u.total_usage;
++			p.internal_bytes = u.internal_usage;
++			p.heap_bytes = u.heap_usage;
++			for (const auto& c : s.contexts) p.contexts += (c.pid == pid);
++			s.mem_used_bytes += p.total_bytes;
++			s.processes.push_back(std::move(p));
++		}
++	}
++
++	DeviceInfo info_;
++	int fd_ = -1;
++	std::map<uint64_t, uint64_t> prev_completions_;
++	bool sensors_supported_ = true;
++	std::string last_error_;
++	int idle_streak_ = 0;
++	bool was_suspended_ = false;
++	std::chrono::steady_clock::time_point last_query_{};
++	uint32_t last_mp_clk_ = 0, last_h_clk_ = 0;
++	std::vector<ProcUsage> last_processes_;
++};
++
++} // namespace xdna
+-- 
+2.43.0
+
