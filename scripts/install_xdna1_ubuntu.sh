@@ -94,7 +94,8 @@ need_flavor_shim() {
 
 write_flavor_shim() {
 	mkdir -p "$WORKDIR"
-	sed -E 's/^ID=.*/ID=ubuntu/' /etc/os-release > "$(flavor_shim_path)"
+	# Real Ubuntu has ID_LIKE=debian; xdna-driver's CPack picks .deb by matching "debian".
+	sed -E 's/^ID=.*/ID=ubuntu/; s/^ID_LIKE=.*/ID_LIKE="ubuntu debian"/' /etc/os-release > "$(flavor_shim_path)"
 }
 
 apply_flavor_shim() {
