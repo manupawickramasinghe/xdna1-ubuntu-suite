@@ -3,10 +3,11 @@
 // kernel_check: verify and time one mlir-aie bf16 x bf16 -> f32 matmul kernel
 // (whole_array: A, B, C) against a CPU reference on random data.
 //
-//   g++-14 -O2 -std=c++20 -I../../runtime-cpp -I/opt/xilinx/xrt/include kernel_check.cpp \
-//       -L/opt/xilinx/xrt/lib -lxrt_coreutil     (cont.) -Wl,-rpath,/opt/xilinx/xrt/lib -o kernel_check
-//   ./kernel_check ../kernels/mm_bf16_f32_256x2304x256.xclbin \
-//       ../kernels/mm_bf16_f32_256x2304x256.insts.bin 256 2304 256
+//   build: g++-14 -O2 -std=c++20 -I../../runtime-cpp -I/opt/xilinx/xrt/include
+//          kernel_check.cpp -L/opt/xilinx/xrt/lib -lxrt_coreutil
+//          -Wl,-rpath,/opt/xilinx/xrt/lib -o kernel_check
+//   run:   ./kernel_check KERNEL.xclbin KERNEL.insts.bin M K N
+//          e.g. ../kernels/mm_bf16_f32_256x2304x256.{xclbin,insts.bin} 256 2304 256
 //
 // Note: a kernel that passes here can still fail when co-resident with other
 // kernels on the NPU (see kernels-unsafe/); npu-face validates every layer at startup.
