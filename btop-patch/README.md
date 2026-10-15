@@ -32,5 +32,15 @@ btop-patch/build_btop.sh             # → ~/.cache/xdna1-btop/build/btop
 btop-patch/build_btop.sh --install   # also install to /usr/local
 ```
 
+No-sudo install (`~/.local/bin` is ahead of `/usr/local/bin` in a default Ubuntu PATH):
+
+```bash
+install -Dm755 ~/.cache/xdna1-btop/build/btop ~/.local/bin/btop && hash -r
+```
+
+**The NPU won't appear if `shown_boxes` in `~/.config/btop/btop.conf` lacks its `gpuN` entry.**
+On an 8600G the iGPU is `gpu0` and the NPU is `gpu1`:
+`shown_boxes = "proc mem gpu0 gpu1 cpu net"`. You can also press <kbd>6</kbd> in btop.
+
 Needs `g++-14` (btop uses `std::ranges::to`). The script copies the current
 `include/xdna_telemetry.hpp` over the copy embedded in the patch.
