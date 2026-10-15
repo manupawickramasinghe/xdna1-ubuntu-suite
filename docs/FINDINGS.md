@@ -73,5 +73,5 @@ Built `nod-ai/iree-amd-aie` @ `fddfec1b` (IREE 3.12.0.dev `2608330`) from source
   conv-decompose`, 21 fail. Upstream's own CI says the same: named conv ops lowered to
   `linalg.generic` are unsupported, and depthwise conv tests are disabled.
 * Consequence: face (SFace/ArcFace) and plate OCR (PaddleOCR det/rec, LPRNet) can't run on
-  npu1 through IREE today. Only only matmul-dominated graphs are candidates, and per-dispatch overhead
+  npu1 through IREE today. Only matmul-dominated graphs are candidates, and per-dispatch overhead
   (~2 ms) rules out small models anyway.
