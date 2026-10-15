@@ -23,6 +23,8 @@ jobs:
           sed 's/@[A-Za-z_]*@/0/g' xrt/src/CMake/config/version-slim.h.in > stub/xrt/detail/version-slim.h
       - name: Compile-check runtime-cpp against XRT headers
         run: g++ -std=c++20 -fsyntax-only -Wall -Wextra -Iruntime-cpp -Istub -Ixrt/src/runtime_src/core/include runtime-cpp/xdna_daemon.cpp
+      - name: Build xdna-top
+        run: cargo build --release --manifest-path monitor-rs/Cargo.toml
       - name: Check scripts
         run: |
           bash -n scripts/install_xdna1_ubuntu.sh btop-patch/build_btop.sh
