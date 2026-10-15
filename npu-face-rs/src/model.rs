@@ -92,11 +92,19 @@ struct Node {
     inputs: Vec<String>,
     output: String,
     attrs: Attrs,
-    /// packed weight matrix for NPU ops
+    /// runs as a matmul (regular Conv via im2col, Gemm, MatMul with constant B)
+    npu: bool,
+    /// weights packed for the matmul backend; built on first run, when M is known
     packed: Option<PackedB>,
 }
 
 pub struct Model {
+    /// per-op-type wall time (seconds), filled when NPU_FACE_PROFILE is set
+    pub profile: HashMap<String, f64>,
+    /// when set, every NPU conv is recomputed on the CPU with bf16 numerics and
+    /// the worst (lowest cosine, highest max-error) layer is recorded
+    pub validate: bool,
+    pub worst_layer: Option<(f64, f32, String)>,
     consts: HashMap<String, Tensor>,
     nodes: Vec<Node>,
     pub input: String,
@@ -118,7 +126,7 @@ fn conv_weight_matrix(w: &Tensor) -> Vec<f32> {
 }
 
 impl Model {
-    pub fn load(path: &str, mm: &dyn Matmul) -> Result<Self> {
+    pub fn load(path: &str) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
         let model = onnx::ModelProto::decode(bytes.as_slice()).context("decoding ONNX")?;
         let g = model.graph.ok_or_else(|| anyhow!("model has no graph"))?;
@@ -142,15 +150,16 @@ impl Model {
                 inputs: n.input.clone(),
                 output: n.output[0].clone(),
                 attrs: Attrs::from(n),
+                npu: false,
                 packed: None,
             });
         }
         let input = g.input.iter().map(|i| i.name().to_string()).find(|n| !consts.contains_key(n)).ok_or_else(|| anyhow!("no graph input"))?;
         let output = g.output[0].name().to_string();
 
-        let mut m = Model { consts, nodes, input, output, npu_ops: 0 };
+        let mut m = Model { profile: HashMap::new(), validate: false, worst_layer: None, consts, nodes, input, output, npu_ops: 0 };
         m.fold_batchnorm();
-        m.pack(mm)?;
+        m.mark_matmuls();
         Ok(m)
     }
 
@@ -205,50 +214,68 @@ impl Model {
         });
     }
 
-    fn pack(&mut self, mm: &dyn Matmul) -> Result<()> {
+    fn mark_matmuls(&mut self) {
         for n in &mut self.nodes {
-            match n.op.as_str() {
-                "Conv" if n.attrs.i("group", 1) == 1 => {
-                    let w = &self.consts[&n.inputs[1]];
-                    let b = conv_weight_matrix(w);
-                    n.packed = Some(mm.pack(&b, b.len() / w.shape[0], w.shape[0]));
-                }
-                "Gemm" => {
-                    let w = &self.consts[&n.inputs[1]];
-                    let alpha = n.attrs.f("alpha", 1.0);
-                    let (r, c) = (w.shape[0], w.shape[1]);
-                    // want B as [K, N]
-                    let (k, nn, b): (usize, usize, Vec<f32>) = if n.attrs.i("transB", 0) == 1 {
-                        let mut t = vec![0f32; r * c];
-                        for i in 0..r {
-                            for j in 0..c {
-                                t[j * r + i] = w.data[i * c + j] * alpha;
-                            }
-                        }
-                        (c, r, t)
-                    } else {
-                        (r, c, w.data.iter().map(|v| v * alpha).collect())
-                    };
-                    n.packed = Some(mm.pack(&b, k, nn));
-                }
-                "MatMul" if self.consts.contains_key(&n.inputs[1]) => {
-                    let w = &self.consts[&n.inputs[1]];
-                    n.packed = Some(mm.pack(&w.data, w.shape[0], w.shape[1]));
-                }
-                _ => {}
-            }
+            n.npu = match n.op.as_str() {
+                "Conv" => n.attrs.i("group", 1) == 1,
+                "Gemm" => true,
+                "MatMul" => self.consts.contains_key(&n.inputs[1]),
+                _ => false,
+            };
         }
-        Ok(())
+    }
+
+    /// B matrix [K, N] (row-major) of a matmul node.
+    fn weight_matrix(&self, n: &Node) -> (Vec<f32>, usize, usize) {
+        let w = &self.consts[&n.inputs[1]];
+        match n.op.as_str() {
+            "Conv" => {
+                let b = conv_weight_matrix(w);
+                let oc = w.shape[0];
+                (b.clone(), b.len() / oc, oc)
+            }
+            "Gemm" => {
+                let alpha = n.attrs.f("alpha", 1.0);
+                let (r, c) = (w.shape[0], w.shape[1]);
+                if n.attrs.i("transB", 0) == 1 {
+                    let mut t = vec![0f32; r * c];
+                    for i in 0..r {
+                        for j in 0..c {
+                            t[j * r + i] = w.data[i * c + j] * alpha;
+                        }
+                    }
+                    (t, c, r)
+                } else {
+                    (w.data.iter().map(|v| v * alpha).collect(), r, c)
+                }
+            }
+            _ => (w.data.clone(), w.shape[0], w.shape[1]),
+        }
     }
 
     pub fn run(&mut self, mm: &mut dyn Matmul, x: Tensor) -> Result<Tensor> {
-        let mut env: HashMap<&str, Tensor> = HashMap::new();
-        env.insert(self.input.as_str(), x);
+        let mut env: HashMap<String, Tensor> = HashMap::new();
+        env.insert(self.input.clone(), x);
         let mut npu_ops = 0;
-        for n in &self.nodes {
+        let profiling = std::env::var_os("NPU_FACE_PROFILE").is_some();
+        let mut worst: Option<(f64, f32, String)> = None;
+        for idx in 0..self.nodes.len() {
+            let t_op = std::time::Instant::now();
+            if self.nodes[idx].npu && self.nodes[idx].packed.is_none() {
+                let n = &self.nodes[idx];
+                let src = env.get(&n.inputs[0]).or_else(|| self.consts.get(&n.inputs[0])).ok_or_else(|| anyhow!("missing tensor {}", n.inputs[0]))?;
+                let m = match n.op.as_str() {
+                    "Conv" => conv_out_hw(src, &self.consts[&n.inputs[1]], &n.attrs).iter().product(),
+                    _ => src.data.len() / src.shape.last().unwrap(),
+                };
+                let (b, k, nn) = self.weight_matrix(n);
+                let packed = mm.pack(&b, m, k, nn);
+                self.nodes[idx].packed = Some(packed);
+            }
+            let n = &self.nodes[idx];
             let get = |i: usize| -> Result<&Tensor> {
                 let name = &n.inputs[i];
-                env.get(name.as_str()).or_else(|| self.consts.get(name)).ok_or_else(|| anyhow!("missing tensor {name}"))
+                env.get(name).or_else(|| self.consts.get(name)).ok_or_else(|| anyhow!("missing tensor {name}"))
             };
             let y = match n.op.as_str() {
                 "Conv" => {
@@ -258,9 +285,10 @@ impl Model {
                     if n.packed.is_some() {
                         npu_ops += 1;
                     }
-                    conv(x, w, bias, &n.attrs, n.packed.as_ref(), mm)?
+                    let v = if self.validate { Some(&mut worst) } else { None };
+                    conv(x, w, bias, &n.attrs, n.packed.as_ref(), mm, v)?
                 }
-                "Gemm" | "MatMul" if n.packed.is_some() => {
+                "Gemm" | "MatMul" if n.npu => {
                     let a = get(0)?;
                     let k = *a.shape.last().unwrap();
                     let m = a.data.len() / k;
@@ -270,13 +298,13 @@ impl Model {
                     if n.op == "Gemm" && n.inputs.len() > 2 && !n.inputs[2].is_empty() {
                         let bias = get(2)?;
                         let beta = n.attrs.f("beta", 1.0);
-                        for row in c.chunks_mut(pb.n) {
+                        for row in c.chunks_mut(pb.n()) {
                             for (j, v) in row.iter_mut().enumerate() {
                                 *v += beta * bias.data[j % bias.data.len()];
                             }
                         }
                     }
-                    Tensor::new(vec![m, pb.n], c)
+                    Tensor::new(vec![m, pb.n()], c)
                 }
                 "BatchNormalization" => {
                     let x = get(0)?;
@@ -345,10 +373,16 @@ impl Model {
                 }
                 op => bail!("ONNX op {op} is not supported"),
             };
-            env.insert(n.output.as_str(), y);
+            if profiling {
+                *self.profile.entry(n.op.clone()).or_default() += t_op.elapsed().as_secs_f64();
+            }
+            env.insert(n.output.clone(), y);
         }
         self.npu_ops = npu_ops;
-        env.remove(self.output.as_str()).ok_or_else(|| anyhow!("output {} not produced", self.output))
+        if self.validate {
+            self.worst_layer = worst;
+        }
+        env.remove(&self.output).ok_or_else(|| anyhow!("output {} not produced", self.output))
     }
 }
 
@@ -393,7 +427,63 @@ fn binary(a: &Tensor, b: &Tensor, f: impl Fn(f32, f32) -> f32 + Sync) -> Result<
     Ok(Tensor::new(out, data))
 }
 
-fn conv(x: &Tensor, w: &Tensor, bias: Option<&Tensor>, at: &Attrs, packed: Option<&PackedB>, mm: &mut dyn Matmul) -> Result<Tensor> {
+/// Fill one output row (all ox for a given oy) of the im2col matrix. Zero
+/// padding is skipped: callers start from a zeroed buffer.
+#[allow(clippy::too_many_arguments)]
+fn im2col_row(
+    x: &Tensor,
+    oy: usize,
+    ow: usize,
+    (kh, kw): (usize, usize),
+    (sh, sw): (usize, usize),
+    (dh, dw): (usize, usize),
+    (pt, pl): (usize, usize),
+    k: usize,
+    mut put: impl FnMut(usize, f32),
+) {
+    let (c, h, wd) = (x.shape[1], x.shape[2], x.shape[3]);
+    for ci in 0..c {
+        for i in 0..kh {
+            let yy = (oy * sh + i * dh) as isize - pt as isize;
+            if yy < 0 || yy as usize >= h {
+                continue;
+            }
+            let src = &x.data[(ci * h + yy as usize) * wd..][..wd];
+            for j in 0..kw {
+                let col = (ci * kh + i) * kw + j;
+                // valid ox range: 0 <= ox*sw + j*dw - pl < wd
+                let off = (j * dw) as isize - pl as isize;
+                let lo = if off >= 0 { 0 } else { ((-off) as usize).div_ceil(sw) };
+                let hi = if (wd as isize - off) <= 0 { 0 } else { (((wd as isize - off) as usize) + sw - 1) / sw };
+                for ox in lo..hi.min(ow) {
+                    put(ox * k + col, src[(ox * sw) as usize + off as usize]);
+                }
+            }
+        }
+    }
+}
+
+fn conv_out_hw(x: &Tensor, w: &Tensor, at: &Attrs) -> [usize; 2] {
+    let (h, wd) = (x.shape[2], x.shape[3]);
+    let (kh, kw) = (w.shape[2], w.shape[3]);
+    let s = at.is("strides", &[1, 1]);
+    let dl = at.is("dilations", &[1, 1]);
+    let p = at.is("pads", &[0, 0, 0, 0]);
+    let oh = (h + (p[0] + p[2]) as usize - dl[0] as usize * (kh - 1) - 1) / s[0] as usize + 1;
+    let ow = (wd + (p[1] + p[3]) as usize - dl[1] as usize * (kw - 1) - 1) / s[1] as usize + 1;
+    [oh, ow]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conv(
+    x: &Tensor,
+    w: &Tensor,
+    bias: Option<&Tensor>,
+    at: &Attrs,
+    packed: Option<&PackedB>,
+    mm: &mut dyn Matmul,
+    validate: Option<&mut Option<(f64, f32, String)>>,
+) -> Result<Tensor> {
     let (c, h, wd) = (x.shape[1], x.shape[2], x.shape[3]);
     let (oc, kh, kw) = (w.shape[0], w.shape[2], w.shape[3]);
     let s = at.is("strides", &[1, 1]);
@@ -414,22 +504,45 @@ fn conv(x: &Tensor, w: &Tensor, bias: Option<&Tensor>, at: &Attrs, packed: Optio
 
     let mut y = vec![0f32; oc * oh * ow];
     if let Some(pk) = packed {
-        // im2col: A[OH*OW, C*kh*kw]
+        // im2col: A[OH*OW, C*kh*kw]; one output row (oy) per task, edge-aware so
+        // the inner loop over ox has no per-element bounds checks.
         let k = c * kh * kw;
-        let mut a = vec![0f32; oh * ow * k];
-        a.par_chunks_mut(k).enumerate().for_each(|(pos, row)| {
-            let (oy, ox) = (pos / ow, pos % ow);
-            for ci in 0..c {
-                for i in 0..kh {
-                    for j in 0..kw {
-                        let yy = (oy * sh + i * dh) as isize - pt as isize;
-                        let xx = (ox * sw + j * dw) as isize - pl as isize;
-                        row[(ci * kh + i) * kw + j] = px(ci, yy, xx);
-                    }
+        let cm = if mm.wants_bf16(pk) {
+            let mut a = vec![0u16; oh * ow * k];
+            a.par_chunks_mut(ow * k).enumerate().for_each(|(oy, blk)| {
+                im2col_row(x, oy, ow, (kh, kw), (sh, sw), (dh, dw), (pt, pl), k, |idx, v| blk[idx] = crate::npu::bf16(v));
+            });
+            mm.matmul_bf16(&a, oh * ow, pk)?
+        } else {
+            let mut a = vec![0f32; oh * ow * k];
+            a.par_chunks_mut(ow * k).enumerate().for_each(|(oy, blk)| {
+                im2col_row(x, oy, ow, (kh, kw), (sh, sw), (dh, dw), (pt, pl), k, |idx, v| blk[idx] = v);
+            });
+            mm.matmul(&a, oh * ow, pk)?
+        }; // [OH*OW, OC]
+        if validate.is_some() || std::env::var_os("NPU_FACE_CHECK").is_some() {
+            let mut a = vec![0f32; oh * ow * k];
+            a.par_chunks_mut(ow * k).enumerate().for_each(|(oy, blk)| {
+                im2col_row(x, oy, ow, (kh, kw), (sh, sw), (dh, dw), (pt, pl), k, |idx, v| blk[idx] = v);
+            });
+            let b = conv_weight_matrix(w);
+            let r = crate::npu::cpu_matmul(&a, k, oc, &b.iter().map(|&v| crate::npu::from_bf16(crate::npu::bf16(v))).collect::<Vec<_>>(), true);
+            let num: f64 = cm.iter().zip(&r).map(|(p, q)| (*p as f64) * (*q as f64)).sum();
+            let den = (cm.iter().map(|p| (*p as f64).powi(2)).sum::<f64>() * r.iter().map(|q| (*q as f64).powi(2)).sum::<f64>()).sqrt();
+            let maxerr = cm.iter().zip(&r).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+            let maxref = r.iter().map(|q| q.abs()).fold(0f32, f32::max);
+            let (cosv, rel) = (num / den, maxerr / maxref.max(1e-12));
+            if std::env::var_os("NPU_FACE_CHECK").is_some() {
+                eprintln!("check conv M={} K={} N={}: cosine {:.6} max_err/max_ref {:.2e}", oh * ow, k, oc, cosv, rel);
+            }
+            if let Some(v) = validate {
+                let name = format!("conv M={} K={} N={}", oh * ow, k, oc);
+                let worse = match v { None => true, Some((c, r, _)) => cosv < *c || rel > *r };
+                if worse {
+                    *v = Some((cosv.min(v.as_ref().map_or(1.0, |x| x.0)), rel.max(v.as_ref().map_or(0.0, |x| x.1)), name));
                 }
             }
-        });
-        let cm = mm.matmul(&a, oh * ow, pk)?; // [OH*OW, OC]
+        }
         y.par_chunks_mut(oh * ow).enumerate().for_each(|(o, plane)| {
             for (pos, v) in plane.iter_mut().enumerate() {
                 *v = cm[pos * oc + o];

@@ -4,10 +4,14 @@ Runs ONNX face-embedding CNNs (SFace, Frigate's ArcFace) with every regular conv
 fully-connected layer executed as **bf16 matmuls on the XDNA1 NPU** through XRT, and serves them to
 Frigate over TCP.
 
-* `kernels/mm_bf16_f32_512x256x256.{xclbin,insts.bin}` is one fixed-shape mlir-aie (`whole_array`,
-  v1.3.4, 4 columns, core tiles 64×64×32) bf16×bf16→f32 matmul kernel. It is exact in 20/20 random
-  runs and takes 167 µs/tile (~400 GFLOP/s). The host splits any matmul into these tiles and
-  accumulates K partial sums in f32, so there's one hardware context and no per-shape kernels.
+* `kernels/` has three fixed-shape mlir-aie (`whole_array`, v1.3.4, 4 columns) bf16×bf16→f32 matmul
+  kernels sized for ArcFace's ResNet stages: `512x1152x128`, `256x2304x256`, `256x4608x256`. Each is
+  exact against a double-precision reference (error ≈ 1e-7·√K, i.e. f32 accumulation) and runs
+  ~0.7–1.0 TFLOP/s. The host picks the cheapest kernel per layer (calls × (measured µs + host
+  overhead)), packs that layer's weights once into pinned NPU buffers, and keeps two tiles in flight
+  (double buffering). `kernels-generic/` holds smaller general-purpose tiles.
+* `kernels-unsafe/512x576x128` is exact alone but **corrupts tiles when it shares the NPU with
+  `256x2304x256`** (up to 61–89% max error in some K=576 layers). Not loaded.
 * `src/model.rs` is a small ONNX interpreter. Conv (group = 1) runs via im2col on the NPU. Depthwise
   conv, PReLU, BatchNorm (folded into convs at load), Add/Mul/Sub/... run on the CPU (rayon).
 * `shim/xmm_shim.cpp` is a C ABI over the XRT runner from `runtime-cpp/`.
@@ -19,7 +23,10 @@ target/release/npu-face bench    --model arcface.onnx
 target/release/npu-face serve    --model arcface.onnx --listen 127.0.0.1:5800
 ```
 
-`serve` refuses to start if the NPU disagrees with the bf16-emulated CPU path (cosine < 0.999).
+`serve` and `selftest` validate **every NPU layer** against a CPU recomputation with the same bf16
+numerics (per-layer cosine ≥ 0.9999 and max error ≤ 1% of the layer's range) and refuse to run
+otherwise. A whole-network cosine check alone passed (0.9995) while the faulty kernel combination
+was corrupting layers, so it isn't enough.
 
 Protocol: request `"XFQ1" | u32 n,c,h,w | f32[n*c*h*w]`; response `"XFR1" | i32 status | u32 n,dim |
 f32[n*dim]` (an error message when status ≠ 0). The Frigate side is `NpuServiceRunner`
@@ -29,4 +36,9 @@ f32[n*dim]` (an error message when status ≠ 0). The Frigate side is `NpuServic
 
 | Model | NPU vs onnxruntime | Latency |
 | --- | --- | --- |
-| SFace (OpenCV zoo) | cosine ≥ 0.9999 on 0–255 inputs | 92 ms in process, 112 ms via TCP |
+| SFace (OpenCV zoo) | cosine ≥ 0.9999 on 0–255 inputs | ~40 ms |
+| **ArcFace IResNet-100 (Frigate `arcface.onnx`)** | NPU vs bf16 CPU 0.99999, vs f32 CPU 0.99997; worst layer error 1.8e-6 | **127 ms p50** (onnxruntime CPU: 70 ms) |
+
+Optimisation history for ArcFace: 418 ms (one 512×256×256 kernel) → 280 ms (4 general kernels, best
+per layer) → 193 ms (pinned weight buffers + double buffering) → 127 ms (stage-sized full-K kernels:
+229 NPU calls/face instead of 1423).

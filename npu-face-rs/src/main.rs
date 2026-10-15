@@ -25,8 +25,7 @@ const RSP_MAGIC: u32 = u32::from_le_bytes(*b"XFR1");
 struct Opts {
     cmd: String,
     model: String,
-    xclbin: String,
-    insts: String,
+    kernels: String,
     listen: String,
     iters: usize,
 }
@@ -35,7 +34,7 @@ fn parse() -> Result<Opts> {
     let exe_dir = std::env::current_exe()?.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let kdir = std::env::var("NPU_FACE_KERNELS").unwrap_or_else(|_| {
         for cand in [exe_dir.join("kernels"), exe_dir.join("../../kernels"), "kernels".into()] {
-            if cand.join("mm_bf16_f32_512x256x256.xclbin").exists() {
+            if cand.is_dir() && std::fs::read_dir(&cand).map(|mut d| d.any(|e| e.map(|e| e.file_name().to_string_lossy().ends_with(".xclbin")).unwrap_or(false))).unwrap_or(false) {
                 return cand.to_string_lossy().into_owned();
             }
         }
@@ -44,8 +43,7 @@ fn parse() -> Result<Opts> {
     let mut o = Opts {
         cmd: String::new(),
         model: String::new(),
-        xclbin: format!("{kdir}/mm_bf16_f32_512x256x256.xclbin"),
-        insts: format!("{kdir}/mm_bf16_f32_512x256x256.insts.bin"),
+        kernels: kdir,
         listen: "127.0.0.1:5800".into(),
         iters: 20,
     };
@@ -55,15 +53,14 @@ fn parse() -> Result<Opts> {
         let mut v = || args.next().context("missing value");
         match a.as_str() {
             "--model" => o.model = v()?,
-            "--xclbin" => o.xclbin = v()?,
-            "--insts" => o.insts = v()?,
+            "--kernels" => o.kernels = v()?,
             "--listen" => o.listen = v()?,
             "--iters" => o.iters = v()?.parse()?,
             _ => bail!("unknown option {a}"),
         }
     }
     if o.model.is_empty() || !["selftest", "bench", "serve"].contains(&o.cmd.as_str()) {
-        bail!("usage: npu-face <selftest|bench|serve> --model FILE.onnx [--listen ADDR] [--xclbin F --insts F]");
+        bail!("usage: npu-face <selftest|bench|serve> --model FILE.onnx [--listen ADDR] [--kernels DIR]");
     }
     Ok(o)
 }
@@ -90,14 +87,32 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn open_npu(o: &Opts) -> Result<NpuMatmul> {
-    NpuMatmul::open(&o.xclbin, &o.insts, 512, 256, 256).context("opening NPU matmul kernel")
+    let npu = NpuMatmul::open_dir(&o.kernels).context("opening NPU matmul kernels")?;
+    eprintln!("npu-face: kernels {}", npu.describe());
+    Ok(npu)
+}
+
+/// Run one input with every NPU layer recomputed on the CPU (bf16 numerics).
+/// Whole-network cosine alone can hide corrupted layers, so check each one.
+fn validate_layers(m: &mut Model, npu: &mut NpuMatmul) -> Result<()> {
+    m.validate = true;
+    m.run(npu, random_input(11))?;
+    m.validate = false;
+    if let Some((cos, rel, name)) = m.worst_layer.take() {
+        eprintln!("npu-face: per-layer check: worst cosine {cos:.6}, worst max_err/max_ref {rel:.2e} ({name})");
+        if cos < 0.9999 || rel > 1e-2 {
+            bail!("NPU per-layer validation failed at {name}: cosine {cos:.6}, max_err/max_ref {rel:.2e}");
+        }
+    }
+    Ok(())
 }
 
 fn selftest(o: &Opts) -> Result<()> {
     let mut npu = open_npu(o)?;
     let mut cpu = CpuMatmul { bf16_inputs: false };
-    let mut m_npu = Model::load(&o.model, &npu)?;
-    let mut m_cpu = Model::load(&o.model, &cpu)?;
+    let mut m_npu = Model::load(&o.model)?;
+    validate_layers(&mut m_npu, &mut npu)?;
+    let mut m_cpu = Model::load(&o.model)?;
     let mut worst = 1f32;
     for i in 0..o.iters as u64 {
         let x = random_input(i + 1);
@@ -113,7 +128,7 @@ fn selftest(o: &Opts) -> Result<()> {
     );
     // bf16-emulated CPU: isolates NPU faults from bf16 rounding of the model itself
     let mut emu = CpuMatmul { bf16_inputs: true };
-    let mut m_emu = Model::load(&o.model, &emu)?;
+    let mut m_emu = Model::load(&o.model)?;
     let (mut w_emu, mut w_ne) = (1f32, 1f32);
     for i in 0..o.iters as u64 {
         let x = random_input(i + 1);
@@ -136,9 +151,10 @@ fn selftest(o: &Opts) -> Result<()> {
 
 fn bench(o: &Opts) -> Result<()> {
     let mut npu = open_npu(o)?;
-    let mut m = Model::load(&o.model, &npu)?;
+    let mut m = Model::load(&o.model)?;
     m.run(&mut npu, random_input(1))?; // warm-up
     let (c0, s0) = npu.stats();
+    (npu.t_wait, npu.t_fill, npu.t_acc) = (0.0, 0.0, 0.0);
     let mut ts = Vec::new();
     for i in 0..o.iters as u64 {
         let t = Instant::now();
@@ -146,6 +162,21 @@ fn bench(o: &Opts) -> Result<()> {
         ts.push(t.elapsed().as_secs_f64() * 1e3);
     }
     let (c1, s1) = npu.stats();
+    let it = o.iters as f64;
+    eprintln!(
+        "  tile loop per embedding: wait {:.1} ms, fill A {:.1} ms, accumulate {:.1} ms",
+        npu.t_wait * 1e3 / it,
+        npu.t_fill * 1e3 / it,
+        npu.t_acc * 1e3 / it
+    );
+    if !m.profile.is_empty() {
+        let mut v: Vec<_> = m.profile.iter().collect();
+        v.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+        let total: f64 = v.iter().map(|x| x.1).sum();
+        for (op, t) in v {
+            eprintln!("  {op:20} {:7.1} ms/embedding ({:.0}%)", t * 1e3 / (o.iters + 1) as f64, t / total * 100.0);
+        }
+    }
     ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let calls = (c1 - c0) as f64 / o.iters as f64;
     println!(
@@ -176,17 +207,18 @@ fn respond(w: &mut impl Write, status: i32, n: u32, dim: u32, payload: &[u8]) ->
 
 fn serve(o: &Opts) -> Result<()> {
     let mut npu = open_npu(o)?;
-    let mut m = Model::load(&o.model, &npu)?;
+    let mut m = Model::load(&o.model)?;
     // Refuse to serve if the NPU disagrees with a CPU run using the same bf16
     // numerics (an exact-f32 comparison would also flag the model's own bf16 rounding).
     let mut cpu = CpuMatmul { bf16_inputs: true };
-    let mut m_cpu = Model::load(&o.model, &cpu)?;
+    let mut m_cpu = Model::load(&o.model)?;
     let x = random_input(7);
     let c = cosine(&m.run(&mut npu, x.clone())?.data, &m_cpu.run(&mut cpu, x)?.data);
     drop(m_cpu);
     if c < 0.999 {
         bail!("startup check failed: NPU vs CPU cosine {c:.5}");
     }
+    validate_layers(&mut m, &mut npu)?;
     let listener = TcpListener::bind(&o.listen).with_context(|| format!("binding {}", o.listen))?;
     eprintln!("npu-face: serving {} on {} (startup check cosine {c:.5}, {} NPU ops/embedding)", o.model, o.listen, m.npu_ops);
 

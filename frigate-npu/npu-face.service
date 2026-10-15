@@ -1,0 +1,20 @@
+[Unit]
+Description=npu-face: Frigate face embeddings on the AMD XDNA NPU
+After=network-online.target
+# Frigate downloads arcface.onnx into its model cache on first use
+ConditionPathExists=/mnt/docker/frigate/config/model_cache/facedet/arcface.onnx
+
+[Service]
+User=manupa
+Group=render
+ExecStart=/home/manupa/xdna1-ubuntu-suite/npu-face-rs/target/release/npu-face serve \
+  --model /mnt/docker/frigate/config/model_cache/facedet/arcface.onnx \
+  --listen 127.0.0.1:5800
+Environment=NPU_FACE_KERNELS=/home/manupa/xdna1-ubuntu-suite/npu-face-rs/kernels
+# XRT pins buffer objects; systemd services don't get limits.d memlock
+LimitMEMLOCK=infinity
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
