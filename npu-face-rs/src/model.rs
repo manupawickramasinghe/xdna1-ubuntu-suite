@@ -104,7 +104,12 @@ pub struct Model {
     /// when set, every NPU conv is recomputed on the CPU with bf16 numerics and
     /// the worst (lowest cosine, highest max-error) layer is recorded
     pub validate: bool,
+    /// check only this NPU conv (index among NPU convs) on the next run; used to
+    /// spot-check one rotating layer per request in production
+    pub spot: Option<usize>,
     pub worst_layer: Option<(f64, f32, String)>,
+    /// number of NPU convs (known after the first run)
+    pub npu_convs: usize,
     consts: HashMap<String, Tensor>,
     nodes: Vec<Node>,
     pub input: String,
@@ -157,7 +162,7 @@ impl Model {
         let input = g.input.iter().map(|i| i.name().to_string()).find(|n| !consts.contains_key(n)).ok_or_else(|| anyhow!("no graph input"))?;
         let output = g.output[0].name().to_string();
 
-        let mut m = Model { profile: HashMap::new(), validate: false, worst_layer: None, consts, nodes, input, output, npu_ops: 0 };
+        let mut m = Model { profile: HashMap::new(), validate: false, spot: None, worst_layer: None, npu_convs: 0, consts, nodes, input, output, npu_ops: 0 };
         m.fold_batchnorm();
         m.mark_matmuls();
         Ok(m)
@@ -259,6 +264,7 @@ impl Model {
         let mut npu_ops = 0;
         let profiling = std::env::var_os("NPU_FACE_PROFILE").is_some();
         let mut worst: Option<(f64, f32, String)> = None;
+        let mut conv_idx = 0usize;
         for idx in 0..self.nodes.len() {
             let t_op = std::time::Instant::now();
             if self.nodes[idx].npu && self.nodes[idx].packed.is_none() {
@@ -285,7 +291,11 @@ impl Model {
                     if n.packed.is_some() {
                         npu_ops += 1;
                     }
-                    let v = if self.validate { Some(&mut worst) } else { None };
+                    let check = n.npu && (self.validate || self.spot == Some(conv_idx));
+                    if n.npu {
+                        conv_idx += 1;
+                    }
+                    let v = if check { Some(&mut worst) } else { None };
                     conv(x, w, bias, &n.attrs, n.packed.as_ref(), mm, v)?
                 }
                 "Gemm" | "MatMul" if n.npu => {
@@ -379,7 +389,8 @@ impl Model {
             env.insert(n.output.clone(), y);
         }
         self.npu_ops = npu_ops;
-        if self.validate {
+        self.npu_convs = conv_idx;
+        if self.validate || self.spot.is_some() {
             self.worst_layer = worst;
         }
         env.remove(&self.output).ok_or_else(|| anyhow!("output {} not produced", self.output))

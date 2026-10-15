@@ -28,6 +28,18 @@ numerics (per-layer cosine ≥ 0.9999 and max error ≤ 1% of the layer's range)
 otherwise. A whole-network cosine check alone passed (0.9995) while the faulty kernel combination
 was corrupting layers, so it isn't enough.
 
+While serving it also:
+* **spot-checks one rotating NPU layer per embedding** against the CPU (~10 ms), covering all 104
+  ArcFace layers every 104 faces;
+* **fully re-validates every 10 minutes**;
+* on any mismatch, returns an error to Frigate (so no wrong embedding is stored) and exits, and
+  systemd restarts it and re-validates.
+
+Observed on npu1: the first validation right after a restart can fail (identically: cosine 0.999968,
+max error 24% at `conv M=784 K=1152 N=256`) while the previous process's NPU state is being torn
+down. The next start passes, so a restart takes ~10–20 s. While the service holds its 3 contexts,
+other processes can't create NPU contexts (`ENODEV`), so they can't co-reside and corrupt it.
+
 Protocol: request `"XFQ1" | u32 n,c,h,w | f32[n*c*h*w]`; response `"XFR1" | i32 status | u32 n,dim |
 f32[n*dim]` (an error message when status ≠ 0). The Frigate side is `NpuServiceRunner`
 (`device: npu` in `face_recognition`).
@@ -37,7 +49,7 @@ f32[n*dim]` (an error message when status ≠ 0). The Frigate side is `NpuServic
 | Model | NPU vs onnxruntime | Latency |
 | --- | --- | --- |
 | SFace (OpenCV zoo) | cosine ≥ 0.9999 on 0–255 inputs | ~40 ms |
-| **ArcFace IResNet-100 (Frigate `arcface.onnx`)** | NPU vs bf16 CPU 0.99999, vs f32 CPU 0.99997; worst layer error 1.8e-6 | **127 ms p50** (onnxruntime CPU: 70 ms) |
+| **ArcFace IResNet-100 (Frigate `arcface.onnx`)** | NPU vs bf16 CPU 0.99999, vs f32 CPU 0.99997; worst layer error 1.8e-6 | **127 ms p50**, 144 ms with per-request spot-check (onnxruntime CPU: 70 ms) |
 
 Optimisation history for ArcFace: 418 ms (one 512×256×256 kernel) → 280 ms (4 general kernels, best
 per layer) → 193 ms (pinned weight buffers + double buffering) → 127 ms (stage-sized full-K kernels:

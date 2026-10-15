@@ -107,16 +107,26 @@ fn open_npu(o: &Opts) -> Result<NpuMatmul> {
 /// Whole-network cosine alone can hide corrupted layers, so check each one.
 fn validate_layers(m: &mut Model, npu: &mut NpuMatmul) -> Result<()> {
     m.validate = true;
-    m.run(npu, random_input(11))?;
+    let r = m.run(npu, random_input(11));
     m.validate = false;
+    r?;
     if let Some((cos, rel, name)) = m.worst_layer.take() {
         eprintln!("npu-face: per-layer check: worst cosine {cos:.6}, worst max_err/max_ref {rel:.2e} ({name})");
-        if cos < 0.9999 || rel > 1e-2 {
-            bail!("NPU per-layer validation failed at {name}: cosine {cos:.6}, max_err/max_ref {rel:.2e}");
-        }
+        check_layer(cos, rel, &name)?;
     }
     Ok(())
 }
+
+fn check_layer(cos: f64, rel: f32, name: &str) -> Result<()> {
+    if cos < 0.9999 || rel > 1e-2 {
+        bail!("NPU per-layer validation failed at {name}: cosine {cos:.6}, max_err/max_ref {rel:.2e}");
+    }
+    Ok(())
+}
+
+/// Full re-validation interval while serving (another process using the NPU
+/// can corrupt results; see kernels-unsafe/README.md).
+const REVALIDATE_SECS: u64 = 600;
 
 fn selftest(o: &Opts) -> Result<()> {
     let mut npu = open_npu(o)?;
@@ -297,6 +307,8 @@ fn serve(o: &Opts) -> Result<()> {
     let listener = TcpListener::bind(&o.listen).with_context(|| format!("binding {}", o.listen))?;
     eprintln!("npu-face: serving {} on {} (stats on {}; startup check cosine {c:.5}, {} NPU ops/embedding)", o.model, o.listen, o.stats, m.npu_ops);
 
+    let mut last_validated = Instant::now();
+    let mut spot_idx = 0usize;
     for stream in listener.incoming() {
         let Ok(mut s) = stream else { continue };
         s.set_nodelay(true).ok();
@@ -326,8 +338,29 @@ fn serve(o: &Opts) -> Result<()> {
             for i in 0..n {
                 let per = c * h * w;
                 let x = Tensor::new(vec![1, c, h, w], data[i * per..(i + 1) * per].to_vec());
+                if last_validated.elapsed().as_secs() >= REVALIDATE_SECS {
+                    if let Err(e) = validate_layers(&mut m, &mut npu) {
+                        let msg = format!("NPU self-check failed, restarting: {e}");
+                        let _ = respond(&mut s, -5, 0, msg.len() as u32, msg.as_bytes());
+                        bail!(msg);
+                    }
+                    last_validated = Instant::now();
+                }
+                // spot-check one rotating NPU layer per embedding
+                if m.npu_convs > 0 {
+                    m.spot = Some(spot_idx % m.npu_convs);
+                    spot_idx += 1;
+                }
                 let (t0, busy0) = (Instant::now(), npu.stats().1);
                 let r = m.run(&mut npu, x);
+                m.spot = None;
+                if let Some((cos, rel, name)) = m.worst_layer.take() {
+                    if let Err(e) = check_layer(cos, rel, &name) {
+                        let msg = format!("NPU spot-check failed, restarting: {e}");
+                        let _ = respond(&mut s, -5, 0, msg.len() as u32, msg.as_bytes());
+                        bail!(msg);
+                    }
+                }
                 {
                     let mut s = st.lock().unwrap();
                     s.busy += npu.stats().1 - busy0;
