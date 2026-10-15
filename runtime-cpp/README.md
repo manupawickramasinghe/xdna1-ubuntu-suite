@@ -17,10 +17,10 @@ XRT doesn't ship generic NPU kernels. Build one with [mlir-aie](https://github.c
 for `npu1` (Phoenix/Hawk Point), e.g. `programming_examples/basic/vector_scalar_mul`:
 
 ```bash
-make NPU2=0           # → build/final.xclbin, build/insts.bin
+make NPU2=0           # npu1 → build/final_8192.xclbin, build/insts_8192.bin
 ```
 
-vector_scalar_mul (int16, 4096 elements) takes one 8192-byte input and one 4-byte scale factor,
+vector_scalar_mul (default `int_bit_width=16`, 4096 elements, kernel `MLIR_AIE`) takes one 8192-byte input and one 4-byte scale factor,
 and produces an 8192-byte output.
 
 ## Build
@@ -32,14 +32,14 @@ cmake -S . -B build && cmake --build build -j   # runtime builds automatically o
 ## Load generator (watch btop / xdna_stat)
 
 ```bash
-build/xdna_daemon --xclbin final.xclbin --insts insts.bin --in 8192,4 --out 8192 \
+build/xdna_daemon --xclbin final_8192.xclbin --insts insts_8192.bin --in 8192,4 --out 8192 \
     --benchmark-loop --duty 50 --period-ms 200
 ```
 
 ## Daemon
 
 ```bash
-build/xdna_daemon --xclbin final.xclbin --insts insts.bin --in 8192,4 --out 8192
+build/xdna_daemon --xclbin final_8192.xclbin --insts insts_8192.bin --in 8192,4 --out 8192
 python3 runtime-cpp/xdna_client.py --in 8192,4 -n 1000
 ```
 

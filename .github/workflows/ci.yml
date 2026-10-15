@@ -9,6 +9,7 @@ jobs:
       XRT_COMMIT: 1ea5176dbcdd31bb1cbe035661f1127e2be22574
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get install -y --no-install-recommends uuid-dev shellcheck
       - name: Build xdna_stat (vendored UAPI header)
         run: |
           cmake -S . -B build -DCMAKE_CXX_FLAGS=-DXDNA_USE_VENDORED_UAPI
