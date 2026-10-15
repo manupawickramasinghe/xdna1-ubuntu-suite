@@ -115,6 +115,18 @@ apply_flavor_shim() {
 	ok "applied $(os_id) → ubuntu flavor shim to XRT/xdna-driver build scripts"
 }
 
+# xclbinutil's gtest unit test links against whichever GoogleTest CMake finds
+# first; a hand-built gtest in /usr/local next to the distro libgtest-dev gives
+# header/library mismatches (undefined MakeAndRegisterTestInfo). The tests
+# aren't needed for an install, so skip that lookup in our checkout.
+apply_build_fixes() {
+	local f="$SRC/xrt/src/runtime_src/tools/xclbinutil/CMakeLists.txt"
+	if [[ -f "$f" ]] && grep -q '^find_package(GTest)' "$f"; then
+		sed -i 's/^find_package(GTest)/set(GTEST_FOUND OFF) # xdna1-ubuntu-suite: unit tests disabled/' "$f"
+		ok "disabled xclbinutil gtest unit test build"
+	fi
+}
+
 # ---------------------------------------------------------------------------
 clone_sources() {
 	if ! command -v git-lfs >/dev/null; then die "git-lfs missing; run the 'deps' stage first"; fi
@@ -164,6 +176,7 @@ stage_build() {
 	[[ $EUID -ne 0 ]] || die "run the build stage as a normal user, not root"
 	clone_sources
 	apply_flavor_shim
+	apply_build_fixes
 
 	( cd "$SRC/xrt/build" && ./build.sh -npu -opt -noctest -j "$JOBS" )
 	ok "XRT packages: $(ls "$SRC"/xrt/build/Release/xrt_*.deb 2>/dev/null | xargs -n1 basename | tr '\n' ' ')"
