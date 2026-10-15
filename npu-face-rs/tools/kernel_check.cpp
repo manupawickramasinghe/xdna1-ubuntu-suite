@@ -4,7 +4,7 @@
 // (whole_array: A, B, C) against a CPU reference on random data.
 //
 //   g++-14 -O2 -std=c++20 -I../../runtime-cpp -I/opt/xilinx/xrt/include kernel_check.cpp \
-//       -L/opt/xilinx/xrt/lib -lxrt_coreutil -Wl,-rpath,/opt/xilinx/xrt/lib -o kernel_check
+//       -L/opt/xilinx/xrt/lib -lxrt_coreutil     (cont.) -Wl,-rpath,/opt/xilinx/xrt/lib -o kernel_check
 //   ./kernel_check ../kernels/mm_bf16_f32_256x2304x256.xclbin \
 //       ../kernels/mm_bf16_f32_256x2304x256.insts.bin 256 2304 256
 //
