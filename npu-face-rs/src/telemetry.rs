@@ -252,6 +252,17 @@ fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..n]).into_owned()
 }
 
+/// Whether a hardware context is doing work right now.
+///
+/// The driver reports `state == ACTIVE` for every context whenever the device
+/// is awake, so the state says nothing about load: counting it made an idle NPU
+/// read 80% (4 of 5 columns owned by loaded but idle contexts) and kept the
+/// idle back-off from ever starting. Only commands in flight, or completions
+/// that advanced since the previous sample, mean the context is working.
+pub fn context_busy(advanced: bool, submissions: u64, completions: u64) -> bool {
+    advanced || submissions > completions
+}
+
 pub fn comm(pid: i64) -> String {
     read_trim(format!("/proc/{pid}/comm"))
 }
@@ -445,7 +456,7 @@ impl Device {
             let key = (e.pid, e.context_id);
             let prev = self.prev.get(&key).copied();
             let advanced = prev.is_some_and(|p| e.command_completions > p);
-            let busy = e.state == HWCTX_STATE_ACTIVE || advanced || e.command_submissions > e.command_completions;
+            let busy = context_busy(advanced, e.command_submissions, e.command_completions);
             let rate = match prev {
                 Some(p) if dt > 0.0 => e.command_completions.saturating_sub(p) as f64 / dt,
                 _ => 0.0,
@@ -517,5 +528,27 @@ impl Device {
             processes: self.last.processes.clone(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::context_busy;
+
+    #[test]
+    fn idle_context_is_not_busy() {
+        // loaded, device awake (state ACTIVE), nothing submitted since the last sample
+        assert!(!context_busy(false, 1200, 1200));
+        assert!(!context_busy(false, 0, 0));
+    }
+
+    #[test]
+    fn commands_in_flight_are_busy() {
+        assert!(context_busy(false, 1201, 1200));
+    }
+
+    #[test]
+    fn completions_since_last_sample_are_busy() {
+        assert!(context_busy(true, 1300, 1300));
     }
 }

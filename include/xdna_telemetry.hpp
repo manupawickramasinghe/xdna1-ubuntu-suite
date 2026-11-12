@@ -110,7 +110,7 @@ struct HwContext {
 	uint64_t heap_usage = 0;      // bytes
 	uint32_t state = 0;           // AMDXDNA_HWCTX_STATE_*
 	uint64_t priority = 0;
-	bool busy = false;            // derived: state ACTIVE or completions advanced since last sample
+	bool busy = false;            // derived: commands in flight or completions advanced since last sample
 };
 
 //* Per-process NPU memory usage (DRM_AMDXDNA_BO_USAGE).
@@ -356,8 +356,8 @@ public:
 		read_contexts(s);
 
 		//* Utilisation: real column sensors when present, else column occupancy
-		//* (columns owned by contexts that are ACTIVE or completed work since the
-		//* last sample, divided by total columns).
+		//* (columns owned by contexts with commands in flight or work completed
+		//* since the last sample, divided by total columns).
 		const uint32_t cols = info_.cols ? info_.cols : 1;
 		if (!s.column_util_pct.empty()) {
 			double sum = 0;
@@ -479,7 +479,9 @@ private:
 			auto it = prev_completions_.find(key);
 			const bool advanced = it != prev_completions_.end() && e.command_completions > it->second;
 			const bool pending = e.command_submissions > e.command_completions;
-			c.busy = e.state == AMDXDNA_HWCTX_STATE_ACTIVE || advanced || pending;
+			// state is ACTIVE for every context whenever the device is awake,
+			// so it is not a load signal: an idle NPU read 80% when it counted.
+			c.busy = advanced || pending;
 			next[key] = e.command_completions;
 			s.contexts.push_back(c);
 		}
